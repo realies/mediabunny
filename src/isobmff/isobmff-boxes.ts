@@ -699,9 +699,13 @@ const opusRollSampleGroups = (trackData: IsobmffTrackData): RollSampleGroups | n
 		for (let j = i - 1; j >= 0; j--) {
 			samplesRemaining -= trackData.samples[j]!.timescaleUnitsToNextSample;
 			distance++;
-			if (samplesRemaining <= 0) break;
+			if (samplesRemaining <= 0) {
+				break;
+			}
 		}
-		if (samplesRemaining > 0) distance = 0;
+		if (samplesRemaining > 0) {
+			distance = 0;
+		}
 		if (distance > 32) {
 			throw new Error('Opus roll recovery requires more than 32 preceding packets.');
 		}

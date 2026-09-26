@@ -186,7 +186,9 @@ for (const codec of ['aac', 'mp3', 'opus', 'pcm-s16'] as const) {
 			const payload = codec === 'mp3'
 				? new Uint8Array(576)
 				: codec === 'pcm-s16' ? new Uint8Array(packetFrames * 2) : new Uint8Array([0xf8, 0]);
-			if (codec === 'mp3') payload.set([0xff, 0xfb, 0xb4, 0xc0]);
+			if (codec === 'mp3') {
+				payload.set([0xff, 0xfb, 0xb4, 0xc0]);
+			}
 			const timestamp = (i * packetFrames - (codec === 'opus' && i === 0 ? 0 : delay)) / sampleRate;
 			// Matroska input reports millisecond durations, but a PCM payload length gives the exact sample count
 			const duration = codec === 'pcm-s16' ? 0.021 : packetFrames / sampleRate;

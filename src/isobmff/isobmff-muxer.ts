@@ -1620,7 +1620,9 @@ export class IsobmffMuxer extends Muxer {
 	}
 
 	private validateExactAudioPresentation(trackData: IsobmffTrackData) {
-		if (trackData.type !== 'audio' || !trackData.info.presentation) return;
+		if (trackData.type !== 'audio' || !trackData.info.presentation) {
+			return;
+		}
 
 		assert(trackData.startTimestampOffset !== null);
 		const rawEnd = trackData.samples.reduce((end, sample) => Math.max(end, sample.timestamp + sample.duration), 0);
