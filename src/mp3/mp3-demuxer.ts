@@ -17,6 +17,7 @@ import {
 	AsyncMutex,
 	binarySearchExact,
 	binarySearchLessOrEqual,
+	clamp,
 	isThenable,
 	toDataView,
 	UNDETERMINED_LANGUAGE,
@@ -168,19 +169,23 @@ export class Mp3Demuxer extends Demuxer {
 				}
 
 				if (!this.xingData) {
-					// Optional Xing fields and the LAME extension must stay inside their frame.
-					const readSize = Math.min(160, header.totalSize - xingOffset - 4);
+					// Optional Xing fields and the LAME extension must stay inside their frame; a field cut off by
+					// the frame's end counts as absent.
+					const readSize = clamp(header.totalSize - xingOffset - 4, 0, 160);
 					let xingDataSlice = this.reader.requestSlice(result.startPos + xingOffset + 4, readSize);
 					if (isThenable(xingDataSlice)) xingDataSlice = await xingDataSlice;
 					if (xingDataSlice) {
 						const xingData = readBytes(xingDataSlice, readSize);
 						const view = toDataView(xingData);
-						const flags = view.getUint32(0, false);
+						const readField = (offset: number) => offset + 4 <= view.byteLength
+							? view.getUint32(offset, false)
+							: null;
+						const flags = readField(0) ?? 0;
 
 						let pos = 4;
-						const frameCount = (flags & XingFlags.FrameCount) ? view.getUint32(pos, false) : null;
+						const frameCount = (flags & XingFlags.FrameCount) ? readField(pos) : null;
 						if (flags & XingFlags.FrameCount) pos += 4;
-						const fileSize = (flags & XingFlags.FileSize) ? view.getUint32(pos, false) : null;
+						const fileSize = (flags & XingFlags.FileSize) ? readField(pos) : null;
 						if (flags & XingFlags.FileSize) pos += 4;
 						if (flags & XingFlags.Toc) pos += 100;
 						if (flags & (1 << 3)) pos += 4; // Quality indicator field
