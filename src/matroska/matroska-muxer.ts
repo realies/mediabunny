@@ -1121,6 +1121,9 @@ export class MatroskaMuxer extends Muxer {
 					durationInSamples = header.audioSamplesInFrame;
 				} else if (track.source._codec === 'opus') {
 					durationInSamples = parseOpusTocByte(packetData).durationInSamples;
+				} else if ((PCM_AUDIO_CODECS as readonly string[]).includes(track.source._codec)) {
+					const { sampleSize } = parsePcmCodec(track.source._codec as PcmAudioCodec);
+					durationInSamples = packetData.byteLength / (sampleSize * trackData.info.numberOfChannels);
 				} else {
 					durationInSamples = Math.round(packet.duration * presentation.sampleRate);
 				}
