@@ -21,7 +21,7 @@ import {
 	vttc,
 	vtte,
 } from './isobmff-boxes';
-import { Muxer } from '../muxer';
+import { getAudioPacketSampleCount, Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputSubtitleTrack, OutputTrack, OutputVideoTrack, TrackType } from '../output';
 import { Writer } from '../writer';
 import { BufferTarget } from '../target';
@@ -58,7 +58,6 @@ import {
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
 	parseOpusIdentificationHeader,
-	parseOpusTocByte,
 } from '../codec-data';
 import { buildIsobmffMimeType } from './isobmff-misc';
 import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
@@ -777,14 +776,20 @@ export class IsobmffMuxer extends Muxer {
 			let timestamp = packet.timestamp;
 			let duration = packet.duration;
 			const presentation = trackData.info.presentation;
-			if (presentation && track.source._codec === 'opus') {
+			if (presentation) {
 				// Sources place Opus PreSkip differently (ISOBMFF starts the first packet at -PreSkip, Ogg clamps it to
-				// zero, encoders leave it out of every timestamp), so the raw coded timeline is rebuilt from the TOC
-				// durations, starting PreSkip before the presentation timestamp.
-				const durationInSamples = parseOpusTocByte(packetData).durationInSamples;
+				// zero, encoders leave it out of every timestamp), and Matroska rounds timestamps to milliseconds, so
+				// the raw coded timeline is rebuilt from each packet's own sample count, starting the head trim before
+				// the presentation timestamp.
+				const sampleRate = track.source._codec === 'opus' ? OPUS_SAMPLE_RATE : trackData.info.sampleRate;
+				const durationInSamples = getAudioPacketSampleCount(
+					track.source._codec,
+					packetData,
+					trackData.info.decoderConfig,
+				);
 				timestamp = presentation.timestamp - presentation.trimStart
-					+ presentation.nextCodedSample / OPUS_SAMPLE_RATE;
-				duration = durationInSamples / OPUS_SAMPLE_RATE;
+					+ presentation.nextCodedSample / sampleRate;
+				duration = durationInSamples / sampleRate;
 				presentation.nextCodedSample += durationInSamples;
 			}
 

@@ -7,13 +7,14 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { MkvOutputFormat } from '../../src/output-format.js';
+import { MkvOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
 import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
 import { EBMLId, readElementHeader, readSignedInt, readUnsignedInt } from '../../src/matroska/ebml.js';
 import { FileSlice } from '../../src/reader.js';
+import { guessDescriptionForAudio } from '../../src/codec.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -200,3 +201,90 @@ for (const codec of ['aac', 'mp3', 'opus', 'pcm-s16'] as const) {
 		expect(readMatroskaIntegers(bytes, EBMLId.SeekPreRoll)).toEqual(codec === 'opus' ? [80000000] : []);
 	});
 }
+
+// Matroska input rounds packet timestamps and durations to whole milliseconds, so exact presentation has to count each
+// packet's samples from its own framing
+for (const codec of ['aac', 'flac', 'ac3', 'eac3', 'dts'] as const) {
+	test(`Exact ${codec} presentation counts the samples of Matroska input exactly`, async () => {
+		const sampleRate = 44100;
+		const packetFrames = { aac: 1024, flac: 4096, ac3: 1536, eac3: 1536, dts: 512 }[codec];
+		const payload = new Uint8Array(codec === 'ac3' ? 138 : codec === 'eac3' ? 192 : 96);
+		payload.set({
+			aac: [],
+			flac: [0xff, 0xf8, 0xc9, 0x08], // A 4096-sample block
+			ac3: [0x0b, 0x77, 0, 0, 0x40, 0x40], // A syncframe at the lowest bit rate
+			eac3: [0x0b, 0x77, 0x00, 0x5f, 0x74, 0x80], // A syncframe of six blocks
+			dts: [0x7f, 0xfe, 0x80, 0x01, 0xfc, 0x3c, 0x05, 0xf0, 0xa1, 0xe0], // A core frame of 512 samples
+		}[codec]);
+		const decoderConfig = {
+			codec: { aac: 'mp4a.40.2', flac: 'flac', ac3: 'ac-3', eac3: 'ec-3', dts: 'dtsc' }[codec],
+			sampleRate,
+			numberOfChannels: 2,
+			description: codec === 'aac'
+				? new Uint8Array([0x12, 0x10])
+				: codec === 'flac'
+					? guessDescriptionForAudio({ codec: 'flac', sampleRate, numberOfChannels: 2 }) as Uint8Array
+					: undefined,
+		};
+		const source = new EncodedAudioPacketSource(codec);
+		const mkv = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		mkv.addAudioTrack(source);
+		await mkv.start();
+		for (let i = 0; i < 5; i++) {
+			await source.add(
+				new EncodedPacket(payload, 'key', i * packetFrames / sampleRate, packetFrames / sampleRate),
+				{ decoderConfig },
+			);
+		}
+		await mkv.finalize();
+
+		using input = new Input({ source: new BufferSource(mkv.target.buffer!), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const inputConfig = await track.getDecoderConfig();
+		assert(inputConfig);
+		const packets: EncodedPacket[] = [];
+		for await (const packet of new EncodedPacketSink(track).packets()) {
+			packets.push(packet);
+		}
+
+		const head = 100;
+		const tail = 200;
+		for (const format of [new MkvOutputFormat(), new Mp4OutputFormat()]) {
+			const exactSource = new EncodedAudioPacketSource(codec);
+			const output = new Output({ format, target: new BufferTarget() });
+			output.addAudioTrack(exactSource, {
+				presentationTimestamp: packets[0]!.timestamp + head / sampleRate,
+				presentationDuration: (5 * packetFrames - head - tail) / sampleRate,
+			});
+			await output.start();
+			for (const packet of packets) {
+				await exactSource.add(packet, { decoderConfig: inputConfig });
+			}
+			await output.finalize();
+			const bytes = Buffer.from(output.target.buffer!);
+			if (format instanceof MkvOutputFormat) {
+				expect(readMatroskaIntegers(bytes, EBMLId.DiscardPadding))
+					.toEqual([-Math.round(1e9 * head / sampleRate), Math.round(1e9 * tail / sampleRate)]);
+			} else {
+				const stts = bytes.indexOf('stts');
+				expect([bytes.readUInt32BE(stts + 8), bytes.readUInt32BE(stts + 16)]).toEqual([1, packetFrames]);
+				const elst = bytes.indexOf('elst');
+				expect(bytes.readInt32BE(elst + 16 + 12 * (bytes.readUInt32BE(elst + 8) - 1))).toBe(head);
+			}
+		}
+	});
+}
+
+test('Exact presentation refuses Vorbis, whose packet lengths depend on the packet before', async () => {
+	const decoderConfig = { codec: 'vorbis', sampleRate: 44100, numberOfChannels: 2 };
+	for (const format of [new MkvOutputFormat(), new Mp4OutputFormat()]) {
+		const source = new EncodedAudioPacketSource('vorbis');
+		const output = new Output({ format, target: new BufferTarget() });
+		output.addAudioTrack(source, { presentationTimestamp: 0, presentationDuration: 1 });
+		await output.start();
+		await expect(source.add(new EncodedPacket(new Uint8Array(1), 'key', 0, 0.01), {
+			decoderConfig: { ...decoderConfig, description: guessDescriptionForAudio(decoderConfig) as Uint8Array },
+		})).rejects.toThrow('Exact audio presentation is not supported for vorbis.');
+	}
+});

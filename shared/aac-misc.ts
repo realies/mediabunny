@@ -15,6 +15,8 @@ export type AacAudioSpecificConfig = {
 	channelConfiguration: number;
 	outputSampleRate: number | null;
 	outputNumberOfChannels: number | null;
+	/** Samples per frame of the core coder, or null for coders whose frames aren't 1024 or 960 samples long */
+	frameLength: number | null;
 };
 
 export const aacFrequencyTable = [
@@ -43,6 +45,7 @@ export const parseAacAudioSpecificConfig = (bytes: Uint8Array | null): AacAudioS
 	let coreObjectType = objectType;
 	let psPresent = false;
 	let outputSampleRate = sampleRate;
+	let coreConfigPos = bitstream.pos;
 
 	if (objectType === 5 || objectType === 29) {
 		// Explicit hierarchical signaling: everything read so far describes the core coder, and the rate the
@@ -55,6 +58,8 @@ export const parseAacAudioSpecificConfig = (bytes: Uint8Array | null): AacAudioS
 		if (coreObjectType === 22) {
 			bitstream.skipBits(4); // extensionChannelConfiguration
 		}
+
+		coreConfigPos = bitstream.pos;
 	} else {
 		// There may be SBR/PS flags sitting behind a sync word after the config of the core coder. We find them by
 		// scanning for the sync word, just like FFmpeg does.
@@ -83,6 +88,12 @@ export const parseAacAudioSpecificConfig = (bytes: Uint8Array | null): AacAudioS
 		psPresent = false;
 	}
 
+	// The config of AAC Main, LC, SSR and LTP starts with frameLengthFlag, which picks 960-sample frames over 1024
+	bitstream.pos = coreConfigPos;
+	const frameLength = coreObjectType >= 1 && coreObjectType <= 4
+		? (bitstream.readBits(1) ? 960 : 1024)
+		: null;
+
 	return {
 		objectType,
 		coreObjectType,
@@ -92,6 +103,7 @@ export const parseAacAudioSpecificConfig = (bytes: Uint8Array | null): AacAudioS
 		outputNumberOfChannels: psPresent && numberOfChannels === 1
 			? 2
 			: numberOfChannels,
+		frameLength,
 	};
 };
 

@@ -29,7 +29,6 @@ import {
 	simplifyRational,
 	textEncoder,
 	toUint8Array,
-	toDataView,
 	uint8ArraysAreEqual,
 	writeBits,
 	roundToDivisor,
@@ -71,13 +70,12 @@ import {
 } from '../codec';
 import { MAX_ADTS_FRAME_HEADER_SIZE, MIN_ADTS_FRAME_HEADER_SIZE, readAdtsFrameHeader } from '../adts/adts-reader';
 import { FileSlice } from '../reader';
-import { Muxer } from '../muxer';
+import { getAudioPacketSampleCount, Muxer } from '../muxer';
 import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
-import { parseOpusIdentificationHeader, parseOpusTocByte } from '../codec-data';
+import { parseOpusIdentificationHeader } from '../codec-data';
 import { AttachedFile } from '../metadata';
 import { Logging } from '../logging';
-import { readMp3FrameHeader } from '../../shared/mp3-misc';
 
 const MIN_CLUSTER_TIMESTAMP_MS = -(2 ** 15);
 const MAX_CLUSTER_TIMESTAMP_MS = 2 ** 15 - 1;
@@ -132,7 +130,6 @@ type MatroskaTrackData = {
 			durationInSamples: number;
 			codecDelayInSamples: number;
 			nextCodedSample: number;
-			aacPacketDurationInSamples: number | null;
 		} | null;
 	};
 } | {
@@ -968,7 +965,6 @@ export class MatroskaMuxer extends Muxer {
 				durationInSamples,
 				codecDelayInSamples,
 				nextCodedSample: 0,
-				aacPacketDurationInSamples: null,
 			};
 		}
 
@@ -1108,26 +1104,11 @@ export class MatroskaMuxer extends Muxer {
 						throw new TypeError('The exact audio presentation begins before the coded sample span.');
 					}
 				}
-				let durationInSamples: number;
-				if (track.source._codec === 'aac') {
-					durationInSamples = presentation.aacPacketDurationInSamples
-						??= Math.round(packet.duration * presentation.sampleRate);
-				} else if (track.source._codec === 'mp3') {
-					if (packetData.byteLength < 4) {
-						throw new TypeError('MP3 packet is too short to contain a frame header.');
-					}
-					const word = toDataView(packetData).getUint32(0, false);
-					const header = readMp3FrameHeader(word, packetData.byteLength).header;
-					if (!header) throw new TypeError('MP3 packet does not contain a valid frame header.');
-					durationInSamples = header.audioSamplesInFrame;
-				} else if (track.source._codec === 'opus') {
-					durationInSamples = parseOpusTocByte(packetData).durationInSamples;
-				} else if ((PCM_AUDIO_CODECS as readonly string[]).includes(track.source._codec)) {
-					const { sampleSize } = parsePcmCodec(track.source._codec as PcmAudioCodec);
-					durationInSamples = packetData.byteLength / (sampleSize * trackData.info.numberOfChannels);
-				} else {
-					durationInSamples = Math.round(packet.duration * presentation.sampleRate);
-				}
+				const durationInSamples = getAudioPacketSampleCount(
+					track.source._codec,
+					packetData,
+					trackData.info.decoderConfig,
+				);
 
 				const headTimestampOffset = track.source._codec === 'opus'
 					? 0
