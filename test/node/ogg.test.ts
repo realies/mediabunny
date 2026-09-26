@@ -564,6 +564,30 @@ test('Ogg muxing counts post-transform drop/split frames [200, 300] at 48 kHz an
 	expect(granulePosition).toBe(620n);
 });
 
+test('Ogg muxing rejects a transform.process sample rate change from 48 kHz to 44.1 kHz', async () => {
+	await expect(writeRawOpus({
+		sampleRate: OPUS_SAMPLE_RATE,
+		bitrate: TWO_PACKET_ENCODER_BITRATE,
+		samples: [
+			{ frameCount: 960, timestamp: 0 },
+			{ frameCount: 960, timestamp: 960 / OPUS_SAMPLE_RATE },
+		],
+		transform: {
+			process: (sample) => {
+				if (sample.timestamp === 0) {
+					return sample;
+				}
+
+				return createSilentAudioSample({
+					frameCount: 882,
+					sampleRate: 44100,
+					timestamp: sample.timestamp,
+				});
+			},
+		},
+	})).rejects.toThrow('Audio sample rate must remain constant after processing. Expected 48000 Hz, got 44100 Hz.');
+});
+
 test('Ogg muxing counts six post-resampler frames at 48 kHz from five 44.1 kHz frames and writes GP 126', async () => {
 	const { granulePosition, encoderFeeds: newEncoderFeeds } = await writeRawOpus({
 		sampleRate: 44100,

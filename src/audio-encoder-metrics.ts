@@ -21,6 +21,12 @@ export const recordRawAudioEncoderFrames = (source: object, frameCount: number, 
 	if (!metrics) {
 		metrics = { frameCount: 0, sampleRate };
 		rawAudioEncoderMetrics.set(source, metrics);
+	} else if (sampleRate !== metrics.sampleRate) {
+		// The encoder was configured for the first sample's rate, so a later rate is an error, not a conversion
+		throw new Error(
+			`Audio sample rate must remain constant after processing. Expected ${metrics.sampleRate} Hz, got`
+			+ ` ${sampleRate} Hz.`,
+		);
 	}
 
 	metrics.frameCount += frameCount;
