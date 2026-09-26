@@ -2347,7 +2347,8 @@ export class Conversion {
 							`Missing ${frames} audio frames exceeds the fixed Opus delay (${delayFrames} frames).`,
 						);
 					}
-					// Only the fixed codec delay may be filled with silence. Recovering real PCM beyond it would need decoder lookahead.
+					// Only the fixed codec delay may be filled with silence. Recovering real PCM beyond it would need
+					// decoder lookahead.
 					using extension = new AudioSample({
 						format: 'f32', sampleRate: fedRate, numberOfChannels: fedChannels,
 						timestamp: fedFrames / fedRate, data: new Float32Array(frames * fedChannels),
