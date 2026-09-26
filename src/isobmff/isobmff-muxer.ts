@@ -25,7 +25,15 @@ import { Muxer } from '../muxer';
 import { Output, OutputAudioTrack, OutputSubtitleTrack, OutputTrack, OutputVideoTrack, TrackType } from '../output';
 import { Writer } from '../writer';
 import { BufferTarget } from '../target';
-import { assert, computeRationalApproximation, last, promiseWithResolvers, Rational, simplifyRational } from '../misc';
+import {
+	assert,
+	computeRationalApproximation,
+	last,
+	promiseWithResolvers,
+	Rational,
+	simplifyRational,
+	toUint8Array,
+} from '../misc';
 import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafOutputFormat } from '../output-format';
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
@@ -48,6 +56,8 @@ import {
 	iterateNalUnitsInAnnexB,
 	serializeAvcDecoderConfigurationRecord,
 	serializeHevcDecoderConfigurationRecord,
+	parseOpusIdentificationHeader,
+	parseOpusTocByte,
 } from '../codec-data';
 import { buildIsobmffMimeType } from './isobmff-misc';
 import { MAX_BOX_HEADER_SIZE, MIN_BOX_HEADER_SIZE } from './isobmff-reader';
@@ -136,6 +146,16 @@ export type IsobmffTrackData = {
 		 */
 		requiresAdtsStripping: boolean;
 		primingPacket: EncodedPacket | null;
+		/**
+		 * Exact decoded presentation interval requested by the caller. This is kept separate from the raw coded
+		 * sample span so an edit list can trim codec priming and padding without rewriting packet data.
+		 */
+		presentation: {
+			timestamp: number;
+			duration: number;
+			trimStart: number;
+		} | null;
+		packetsReceived: number;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -573,6 +593,32 @@ export class IsobmffMuxer extends Muxer {
 			}
 		}
 
+		let presentation: IsobmffAudioTrackData['info']['presentation'] = null;
+		if (track.metadata.presentationTimestamp !== undefined) {
+			if (this.isFragmented) {
+				throw new TypeError('Exact audio presentation metadata requires non-fragmented ISOBMFF output.');
+			}
+
+			let trimStart = packet ? track.metadata.presentationTimestamp - packet.timestamp : 0;
+			if (track.source._codec === 'opus') {
+				const description = decoderConfig.description;
+				if (!description) {
+					throw new TypeError('Exact Opus presentation metadata requires an Opus identification header.');
+				}
+				trimStart = parseOpusIdentificationHeader(toUint8Array(description)).preSkip
+					/ meta.decoderConfig.sampleRate;
+			}
+
+			if (trimStart < 0) {
+				throw new TypeError('The exact audio presentation interval begins before the first decoded sample.');
+			}
+			presentation = {
+				timestamp: track.metadata.presentationTimestamp,
+				duration: track.metadata.presentationDuration!,
+				trimStart,
+			};
+		}
+
 		const newTrackData: IsobmffAudioTrackData = {
 			muxer: this,
 			track,
@@ -587,6 +633,8 @@ export class IsobmffMuxer extends Muxer {
 				expectedNextPcmPacketTimestamp: null,
 				requiresAdtsStripping,
 				primingPacket: packet,
+				presentation,
+				packetsReceived: 0,
 			},
 			timescale: decoderConfig.sampleRate,
 			samples: [],
@@ -726,14 +774,24 @@ export class IsobmffMuxer extends Muxer {
 				packetData = packetData.subarray(headerLength);
 			}
 
-			this.validateTimestamp(
-				trackData.track,
-				packet.timestamp,
-				packet.type === 'key',
-			);
-
 			let timestamp = packet.timestamp;
 			let duration = packet.duration;
+			if (trackData.info.presentation && track.source._codec === 'opus') {
+				// Ogg exposes Opus packet timestamps on the decoded presentation timeline. ISOBMFF stores the raw coded
+				// timeline. Moving the first packet back by PreSkip restores the
+				// same constant packet cadence already carried by every later timestamp.
+				if (trackData.info.packetsReceived === 0) {
+					timestamp -= trackData.info.presentation.trimStart;
+				}
+				duration = parseOpusTocByte(packetData).durationInSamples / trackData.info.sampleRate;
+			}
+			trackData.info.packetsReceived++;
+
+			this.validateTimestamp(
+				trackData.track,
+				timestamp,
+				packet.type === 'key',
+			);
 
 			if (trackData.info.requiresPcmTransformation) {
 				// Packets may have only approximate timestamp/duration information, but for our PCM logic, we need it
@@ -1555,6 +1613,26 @@ export class IsobmffMuxer extends Muxer {
 		}
 	}
 
+	private validateExactAudioPresentation(trackData: IsobmffTrackData) {
+		if (trackData.type !== 'audio' || !trackData.info.presentation) return;
+
+		assert(trackData.startTimestampOffset !== null);
+		const rawEnd = trackData.samples.reduce((end, sample) => Math.max(end, sample.timestamp + sample.duration), 0);
+		const rawSpan = rawEnd - trackData.startTimestampOffset;
+		const mediaTime = trackData.info.presentation.timestamp - trackData.startTimestampOffset;
+		const tolerance = 0.5 / trackData.timescale;
+
+		if (
+			mediaTime < -tolerance
+			|| mediaTime + trackData.info.presentation.duration > rawSpan + tolerance
+		) {
+			throw new Error(
+				`The exact audio presentation interval is not contained in the coded sample span`
+				+ ` (mediaTime=${mediaTime}, duration=${trackData.info.presentation.duration}, rawSpan=${rawSpan}).`,
+			);
+		}
+	}
+
 	/** Finalizes the file, making it ready for use. Must be called after all video and audio chunks have been added. */
 	async finalize() {
 		const release = await this.mutex.acquire();
@@ -1595,6 +1673,7 @@ export class IsobmffMuxer extends Muxer {
 				} else {
 					trackData.avgBitrate = 0;
 				}
+				this.validateExactAudioPresentation(trackData);
 
 				// Sliding one-second window over the samples in decode order
 				let windowStart = 0;

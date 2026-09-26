@@ -10,8 +10,10 @@ import { BufferTarget } from '../../src/target.js';
 import { MkvOutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert } from '../../src/misc.js';
-import { EncodedVideoPacketSource } from '../../src/media-source.js';
+import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { EBMLId, readElementHeader, readSignedInt, readUnsignedInt } from '../../src/matroska/ebml.js';
+import { FileSlice } from '../../src/reader.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 
@@ -137,3 +139,60 @@ const testNegativeTimestampRoundTrip = async (timestamps: number[], duration: nu
 		});
 	}
 };
+
+const readMatroskaIntegers = (bytes: Uint8Array, wanted: number): number[] => {
+	const slice = FileSlice.tempFromBytes(bytes);
+	const values: number[] = [];
+	while (slice.filePos < bytes.length) {
+		const header = readElementHeader(slice);
+		assert(header && header.size != null);
+		const end = slice.filePos + header.size;
+		if (header.id === wanted) {
+			values.push(wanted === EBMLId.DiscardPadding
+				? readSignedInt(slice, header.size)
+				: readUnsignedInt(slice, header.size));
+		} else if ([
+			EBMLId.Segment, EBMLId.Tracks, EBMLId.TrackEntry, EBMLId.Cluster, EBMLId.BlockGroup,
+		].includes(header.id)) {
+			values.push(...readMatroskaIntegers(bytes.subarray(slice.filePos, end), wanted));
+		}
+		slice.skip(end - slice.filePos);
+	}
+	return values;
+};
+
+for (const codec of ['aac', 'mp3', 'opus', 'pcm-s16'] as const) {
+	test(`Matroska exact ${codec} presentation writes signed padding and codec delay`, async () => {
+		const sampleRate = 48000;
+		const packetFrames = codec === 'aac' ? 1024 : codec === 'mp3' ? 1152 : codec === 'opus' ? 960 : 1000;
+		const delay = codec === 'opus' ? 312 : 24;
+		const frames = 2 * packetFrames - delay - 24;
+		const source = new EncodedAudioPacketSource(codec);
+		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
+		const opusHead = new Uint8Array(19);
+		opusHead.set([79, 112, 117, 115, 72, 101, 97, 100, 1, 1]);
+		new DataView(opusHead.buffer).setUint16(10, delay, true);
+		const decoderConfig = {
+			codec: codec === 'aac' ? 'mp4a.40.2' : codec, numberOfChannels: 1, sampleRate,
+			description: codec === 'opus' ? opusHead : codec === 'aac' ? new Uint8Array([0x11, 0x88]) : undefined,
+		};
+		output.addAudioTrack(source, { presentationTimestamp: 0, presentationDuration: frames / sampleRate });
+		await output.start();
+		for (let i = 0; i < 2; i++) {
+			const payload = codec === 'mp3'
+				? new Uint8Array(576)
+				: codec === 'pcm-s16' ? new Uint8Array(packetFrames * 2) : new Uint8Array([0xf8, 0]);
+			if (codec === 'mp3') payload.set([0xff, 0xfb, 0xb4, 0xc0]);
+			const timestamp = (i * packetFrames - (codec === 'opus' && i === 0 ? 0 : delay)) / sampleRate;
+			await source.add(
+				new EncodedPacket(payload, 'key', timestamp, packetFrames / sampleRate), { decoderConfig },
+			);
+		}
+		await output.finalize();
+		const bytes = new Uint8Array(output.target.buffer!);
+		expect(readMatroskaIntegers(bytes, EBMLId.DiscardPadding))
+			.toEqual(codec === 'opus' ? [500000] : [-500000, 500000]);
+		expect(readMatroskaIntegers(bytes, EBMLId.CodecDelay)).toEqual(codec === 'opus' ? [6500000] : []);
+		expect(readMatroskaIntegers(bytes, EBMLId.SeekPreRoll)).toEqual(codec === 'opus' ? [80000000] : []);
+	});
+}

@@ -28,6 +28,7 @@ import {
 	simplifyRational,
 	textEncoder,
 	toUint8Array,
+	toDataView,
 	uint8ArraysAreEqual,
 	writeBits,
 	roundToDivisor,
@@ -56,7 +57,6 @@ import {
 } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
 import {
-	OPUS_SAMPLE_RATE,
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
 	SubtitleCodec,
@@ -72,9 +72,10 @@ import { FileSlice } from '../reader';
 import { Muxer } from '../muxer';
 import { Writer } from '../writer';
 import { EncodedPacket } from '../packet';
-import { parseOpusIdentificationHeader } from '../codec-data';
+import { parseOpusIdentificationHeader, parseOpusTocByte } from '../codec-data';
 import { AttachedFile } from '../metadata';
 import { Logging } from '../logging';
+import { readMp3FrameHeader } from '../../shared/mp3-misc';
 
 const MIN_CLUSTER_TIMESTAMP_MS = -(2 ** 15);
 const MAX_CLUSTER_TIMESTAMP_MS = 2 ** 15 - 1;
@@ -88,6 +89,7 @@ type InternalMediaChunk = {
 	timestamp: number;
 	duration: number;
 	additions: Uint8Array | null;
+	discardPaddingNs: number;
 };
 
 type MatroskaTrackData = {
@@ -121,6 +123,13 @@ type MatroskaTrackData = {
 		 * ADTS-wrapped data.
 		 */
 		requiresAdtsStripping: boolean;
+		presentation: {
+			timestamp: number;
+			durationInSamples: number;
+			codecDelayInSamples: number;
+			nextCodedSample: number;
+			aacPacketDurationInSamples: number | null;
+		} | null;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -333,18 +342,19 @@ export class MatroskaMuxer extends Muxer {
 				}
 			}
 
+			let codecDelayNs = 0;
 			let seekPreRollNs = 0;
 			if (trackData.type === 'audio' && trackData.track.source._codec === 'opus') {
 				seekPreRollNs = 1e6 * 80; // In "Matroska ticks" (nanoseconds)
-
-				const description = trackData.info.decoderConfig.description;
-				if (description) {
-					const bytes = toUint8Array(description);
-					const header = parseOpusIdentificationHeader(bytes);
-
-					// Use the preSkip value from the header
-					seekPreRollNs = Math.round(1e9 * (header.preSkip / OPUS_SAMPLE_RATE));
-				}
+			}
+			if (
+				trackData.type === 'audio'
+				&& trackData.track.source._codec === 'opus'
+				&& trackData.info.presentation
+			) {
+				codecDelayNs = Math.round(
+					1e9 * trackData.info.presentation.codecDelayInSamples / trackData.info.sampleRate,
+				);
 			}
 
 			tracksElement.data.push({ id: EBMLId.TrackEntry, data: [
@@ -375,6 +385,7 @@ export class MatroskaMuxer extends Muxer {
 				trackData.codecPrivate
 					? { id: EBMLId.CodecPrivate, data: toUint8Array(trackData.codecPrivate) }
 					: null,
+				codecDelayNs > 0 ? { id: EBMLId.CodecDelay, data: codecDelayNs } : null,
 				seekPreRollNs > 0 ? { id: EBMLId.SeekPreRoll, data: seekPreRollNs } : null,
 				trackData.track.metadata.name !== undefined
 					? { id: EBMLId.Name, data: new EBMLUnicodeString(trackData.track.metadata.name) }
@@ -924,6 +935,37 @@ export class MatroskaMuxer extends Muxer {
 			requiresAdtsStripping = true;
 		}
 
+		let presentation: MatroskaAudioTrackData['info']['presentation'] = null;
+		if (track.metadata.presentationTimestamp !== undefined) {
+			let codecDelayInSamples: number;
+			if (track.source._codec === 'opus') {
+				const description = decoderConfig.description;
+				if (!description) {
+					throw new TypeError('Exact Opus presentation metadata requires an Opus identification header.');
+				}
+				codecDelayInSamples = parseOpusIdentificationHeader(toUint8Array(description)).preSkip;
+			} else {
+				codecDelayInSamples = Math.round(
+					(track.metadata.presentationTimestamp - (packet?.timestamp ?? track.metadata.presentationTimestamp))
+					* meta.decoderConfig.sampleRate,
+				);
+			}
+
+			const durationInSamples = Math.round(
+				track.metadata.presentationDuration! * meta.decoderConfig.sampleRate,
+			);
+			if (codecDelayInSamples < 0 || durationInSamples < 0) {
+				throw new TypeError('The exact audio presentation interval is outside the coded sample timeline.');
+			}
+			presentation = {
+				timestamp: track.metadata.presentationTimestamp,
+				durationInSamples,
+				codecDelayInSamples,
+				nextCodedSample: 0,
+				aacPacketDurationInSamples: null,
+			};
+		}
+
 		const newTrackData: MatroskaAudioTrackData = {
 			track,
 			type: 'audio',
@@ -932,6 +974,7 @@ export class MatroskaMuxer extends Muxer {
 				sampleRate: meta.decoderConfig.sampleRate,
 				decoderConfig,
 				requiresAdtsStripping,
+				presentation,
 			},
 			chunkQueue: [],
 			lastWrittenMsTimestamp: null,
@@ -1045,10 +1088,83 @@ export class MatroskaMuxer extends Muxer {
 				packetData = packetData.subarray(headerLength);
 			}
 
-			const isKeyFrame = packet.type === 'key';
-			this.validateTimestamp(trackData.track, packet.timestamp, isKeyFrame);
+			let timestamp = packet.timestamp;
+			let duration = packet.duration;
+			let discardPaddingNs = 0;
+			if (trackData.info.presentation) {
+				const presentation = trackData.info.presentation;
+				const isFirstPacket = presentation.nextCodedSample === 0;
+				if (isFirstPacket && track.source._codec !== 'opus') {
+					presentation.codecDelayInSamples = Math.round(
+						(presentation.timestamp - packet.timestamp) * trackData.info.sampleRate,
+					);
+					if (presentation.codecDelayInSamples < 0) {
+						throw new TypeError('The exact audio presentation begins before the coded sample span.');
+					}
+				}
+				let durationInSamples: number;
+				if (track.source._codec === 'aac') {
+					durationInSamples = presentation.aacPacketDurationInSamples
+						??= Math.round(packet.duration * trackData.info.sampleRate);
+				} else if (track.source._codec === 'mp3') {
+					if (packetData.byteLength < 4) {
+						throw new TypeError('MP3 packet is too short to contain a frame header.');
+					}
+					const word = toDataView(packetData).getUint32(0, false);
+					const header = readMp3FrameHeader(word, packetData.byteLength).header;
+					if (!header) throw new TypeError('MP3 packet does not contain a valid frame header.');
+					durationInSamples = header.audioSamplesInFrame;
+				} else if (track.source._codec === 'opus') {
+					durationInSamples = parseOpusTocByte(packetData).durationInSamples;
+				} else {
+					durationInSamples = Math.round(packet.duration * trackData.info.sampleRate);
+				}
 
-			const audioChunk = this.createInternalChunk(packetData, packet.timestamp, packet.duration, packet.type);
+				const headTimestampOffset = track.source._codec === 'opus'
+					? 0
+					: presentation.codecDelayInSamples / trackData.info.sampleRate;
+				timestamp = presentation.timestamp - headTimestampOffset
+					+ presentation.nextCodedSample / trackData.info.sampleRate;
+				duration = durationInSamples / trackData.info.sampleRate;
+				presentation.nextCodedSample += durationInSamples;
+
+				const targetCodedEnd = presentation.codecDelayInSamples + presentation.durationInSamples;
+				const discardPaddingInSamples = Math.max(0, presentation.nextCodedSample - targetCodedEnd);
+				if (discardPaddingInSamples > durationInSamples) {
+					throw new TypeError('The exact audio presentation interval ends before this packet.');
+				}
+				discardPaddingNs = Math.round(
+					1e9 * discardPaddingInSamples / trackData.info.sampleRate,
+				);
+				if (
+					isFirstPacket
+					&& track.source._codec !== 'opus'
+					&& presentation.codecDelayInSamples > 0
+				) {
+					if (discardPaddingNs !== 0) {
+						throw new TypeError('One Matroska block cannot discard padding from both ends.');
+					}
+					discardPaddingNs = -Math.round(
+						1e9 * presentation.codecDelayInSamples / trackData.info.sampleRate,
+					);
+				}
+			}
+
+			const isKeyFrame = packet.type === 'key';
+			this.validateTimestamp(
+				trackData.track,
+				timestamp,
+				isKeyFrame,
+			);
+
+			const audioChunk = this.createInternalChunk(
+				packetData,
+				timestamp,
+				duration,
+				packet.type,
+				null,
+				discardPaddingNs,
+			);
 			trackData.chunkQueue.push(audioChunk);
 			await this.interleaveChunks();
 		} finally {
@@ -1183,6 +1299,7 @@ export class MatroskaMuxer extends Muxer {
 		duration: number,
 		type: 'key' | 'delta',
 		additions: Uint8Array | null = null,
+		discardPaddingNs = 0,
 	) {
 		const internalChunk: InternalMediaChunk = {
 			data,
@@ -1190,6 +1307,7 @@ export class MatroskaMuxer extends Muxer {
 			timestamp,
 			duration,
 			additions,
+			discardPaddingNs,
 		};
 
 		return internalChunk;
@@ -1243,7 +1361,8 @@ export class MatroskaMuxer extends Muxer {
 		}
 
 		if (shouldCreateNewCluster) {
-			this.createNewCluster(msTimestamp);
+			// Cluster timestamps are unsigned, while a signed Block timecode may carry codec pre-roll before zero.
+			this.createNewCluster(Math.max(msTimestamp, 0));
 		}
 
 		const relativeTimestamp = msTimestamp - this.currentClusterStartMsTimestamp!;
@@ -1269,8 +1388,10 @@ export class MatroskaMuxer extends Muxer {
 
 		const msDuration = Math.round(1000 * chunk.duration);
 
-		// Subtitle cues need an explicit BlockDuration (a SimpleBlock has none)
-		const needsBlockGroup = !!chunk.additions || trackData.type === 'subtitle';
+		// Subtitles need BlockDuration; audio needs signed DiscardPadding for exact presentation trim.
+		const needsBlockGroup = !!chunk.additions
+			|| chunk.discardPaddingNs !== 0
+			|| trackData.type === 'subtitle';
 
 		if (!needsBlockGroup) {
 			// No additions, we can write out a SimpleBlock
@@ -1302,6 +1423,9 @@ export class MatroskaMuxer extends Muxer {
 						] }
 					: null,
 				msDuration > 0 ? { id: EBMLId.BlockDuration, data: msDuration } : null,
+				chunk.discardPaddingNs !== 0
+					? { id: EBMLId.DiscardPadding, data: new EBMLSignedInt(chunk.discardPaddingNs) }
+					: null,
 			] };
 			this.ebmlWriter.writeEBML(blockGroup);
 		}
@@ -1421,6 +1545,13 @@ export class MatroskaMuxer extends Muxer {
 
 		for (const trackData of this.trackDatas) {
 			trackData.closed = true;
+			if (trackData.type === 'audio' && trackData.info.presentation) {
+				const presentation = trackData.info.presentation;
+				const targetCodedEnd = presentation.codecDelayInSamples + presentation.durationInSamples;
+				if (presentation.nextCodedSample < targetCodedEnd) {
+					throw new Error('The exact audio presentation interval extends beyond the coded packet span.');
+				}
+			}
 		}
 
 		if (!this.segment) {
