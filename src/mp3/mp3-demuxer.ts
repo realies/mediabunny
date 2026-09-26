@@ -521,11 +521,16 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 
 		try {
 			while (true) {
-				const index = binarySearchLessOrEqual(
+				let index = binarySearchLessOrEqual(
 					this.demuxer.loadedSamples,
 					timestamp,
 					x => x.timestamp,
 				);
+				// Packets that start at or after the declared end present nothing: they stay in decode order, but a
+				// timestamp lookup never lands on them
+				while (index >= 0 && this.demuxer.loadedSamples[index]!.duration === 0) {
+					index--;
+				}
 
 				if (index === -1 && this.demuxer.loadedSamples.length > 0) {
 					// We're before the first sample

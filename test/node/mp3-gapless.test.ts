@@ -45,3 +45,21 @@ test('Xing fields cut off by the end of their frame count as absent', async () =
 	expect(await track.getDurationFromMetadata()).toBeNull();
 	expect(await track.computeDuration()).toBe(1152 / 24000);
 });
+
+test('LAME padding past the start of the last frame separates presentation from decode order', async () => {
+	const bytes = new Uint8Array(576 * 4);
+	for (let i = 0; i < 4; i++) bytes.set([0xff, 0xfb, 0xb4, 0], i * 576);
+	bytes.set([0x58, 0x69, 0x6e, 0x67, 0, 0, 0, 1, 0, 0, 0, 3], 36); // Xing, three coded audio frames
+	bytes.set([0x4c, 0x41, 0x4d, 0x45], 48); // LAME
+	bytes.set([0x24, 0x06, 0xa4], 48 + 21); // Delay 576, padding 1700: the stream ends before the last frame starts
+	using input = new Input({ source: new BufferSource(bytes), formats: [MP3] });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const sink = new EncodedPacketSink(track);
+	const packets = [];
+	for await (const packet of sink.packets()) packets.push(packet);
+	expect(packets.map(packet => packet.duration)).toEqual([1152 / 48000, 1133 / 48000, 0]);
+	expect((await sink.getPacket(Infinity))?.timestamp).toBe(47 / 48000);
+	expect(await track.computeDuration()).toBe(1180 / 48000);
+	expect(await track.getDurationFromMetadata()).toBe(1180 / 48000);
+});
