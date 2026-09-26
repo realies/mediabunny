@@ -23,6 +23,8 @@ import {
 	VideoEncodingConfig,
 } from './encode';
 import { Input } from './input';
+import { IsobmffInputFormat } from './input-format';
+import { parseOpusIdentificationHeader } from './codec-data';
 import { InputAudioTrack, InputTrack, InputVideoTrack } from './input-track';
 import { Logging } from './logging';
 import {
@@ -49,6 +51,7 @@ import {
 	composeRotationAndFlip,
 	promiseWithResolvers,
 	Rotation,
+	toUint8Array,
 } from './misc';
 import { Output, OutputTrackGroup } from './output';
 import { Mp4OutputFormat } from './output-format';
@@ -2213,23 +2216,59 @@ export class Conversion {
 			const source = new AudioSampleSource(encodingConfig);
 			audioSource = source;
 
+			// Packet presentation ends exclude codec fill, even when a decoder emits a full final frame.
+			const endTimestamp = Math.min(this._endTimestamp, await track.computeDuration());
+			const firstTimestamp = await track.getFirstTimestamp();
+			const feedNegativeHead = sourceCodec === 'opus' && firstTimestamp < 0
+				&& firstTimestamp < this._startTimestamp && await this.input.getFormat() instanceof IsobmffInputFormat;
+			let headTrimDuration = 0;
+			let codecDelay = 0;
+			if (feedNegativeHead) {
+				const config = await track.getDecoderConfig();
+				assert(config?.description);
+				const preSkip = parseOpusIdentificationHeader(toUint8Array(config.description)).preSkip;
+				codecDelay = preSkip / config.sampleRate;
+				headTrimDuration = Math.max(this._startTimestamp - firstTimestamp - codecDelay, 0);
+			}
+
 			this._registerTrackPump(async (pump) => {
 				let needsPadding: boolean | null = null;
 
 				const sink = new AudioSampleSink(track);
-				for await (using sample of sink.samples(this._startTimestamp, this._endTimestamp)) {
+				let remainingHeadFrames: number | null = null;
+				let targetFrames = Infinity;
+				let fedFrames = 0;
+				let fedRate = originalSampleRate;
+				let fedChannels = originalNumberOfChannels;
+				const startTimestamp = feedNegativeHead ? undefined : this._startTimestamp;
+				for await (using sample of sink.samples(startTimestamp, endTimestamp)) {
 					if (this._state === 'canceled') {
 						break;
+					}
+
+					if (feedNegativeHead && remainingHeadFrames === null) {
+						remainingHeadFrames = Math.max(Math.round(headTrimDuration * sample.sampleRate), 0);
+						targetFrames = Math.max(
+							Math.round((endTimestamp - this._startTimestamp) * sample.sampleRate), 0,
+						);
+						fedRate = sample.sampleRate;
+						fedChannels = sample.numberOfChannels;
 					}
 
 					let startFrame = 0;
 					let endFrame = sample.numberOfFrames;
 
-					if (sample.timestamp < this._startTimestamp) {
-						startFrame = Math.round((this._startTimestamp - sample.timestamp) * sample.sampleRate);
-					}
-					if (sample.timestamp + sample.duration > this._endTimestamp) {
-						endFrame = Math.round((this._endTimestamp - sample.timestamp) * sample.sampleRate);
+					if (feedNegativeHead) {
+						startFrame = Math.min(remainingHeadFrames!, sample.numberOfFrames);
+						remainingHeadFrames! -= startFrame;
+						endFrame = Math.min(sample.numberOfFrames, startFrame + Math.max(targetFrames - fedFrames, 0));
+					} else {
+						if (sample.timestamp < this._startTimestamp) {
+							startFrame = Math.round((this._startTimestamp - sample.timestamp) * sample.sampleRate);
+						}
+						if (sample.timestamp + sample.duration > endTimestamp) {
+							endFrame = Math.round((endTimestamp - sample.timestamp) * sample.sampleRate);
+						}
 					}
 
 					if (startFrame >= endFrame) {
@@ -2256,8 +2295,13 @@ export class Conversion {
 
 					using finalSample = finalSampleLet;
 
-					// Offset the timestamp as needed
-					finalSample.setTimestamp(finalSample.timestamp + this._timestampOffset);
+					if (feedNegativeHead) {
+						// The decoder consumes pre-skip; only the remaining edit overlap is trimmed here.
+						finalSample.setTimestamp(fedFrames / finalSample.sampleRate);
+						fedFrames += finalSample.numberOfFrames;
+					} else {
+						finalSample.setTimestamp(finalSample.timestamp + this._timestampOffset);
+					}
 
 					if (needsPadding === null) {
 						needsPadding = finalSample.timestamp > 0 && !this.output.format.supportsTimestampedMediaData;
@@ -2293,6 +2337,22 @@ export class Conversion {
 					await this._registerAudioSample(
 						pump, finalSample, source, outputTrackId, () => lastSampleTimestamp,
 					);
+				}
+
+				if (feedNegativeHead && this._state !== 'canceled' && fedFrames < targetFrames) {
+					const frames = targetFrames - fedFrames;
+					const delayFrames = Math.round(codecDelay * fedRate);
+					if (frames > delayFrames) {
+						throw new Error(
+							`Missing ${frames} audio frames exceeds the fixed Opus delay (${delayFrames} frames).`,
+						);
+					}
+					// Only the fixed codec delay may be filled with silence. Recovering real PCM beyond it would need decoder lookahead.
+					using extension = new AudioSample({
+						format: 'f32', sampleRate: fedRate, numberOfChannels: fedChannels,
+						timestamp: fedFrames / fedRate, data: new Float32Array(frames * fedChannels),
+					});
+					await this._registerAudioSample(pump, extension, source, outputTrackId, () => lastSampleTimestamp);
 				}
 
 				source.close();

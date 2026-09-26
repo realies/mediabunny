@@ -3691,11 +3691,22 @@ class IsobmffAudioTrackBacking extends IsobmffTrackBacking implements InputAudio
 				this.internalTrack.info.dtsFormat = firstPacket && extractDtsFourCcFromPacket(firstPacket.data);
 			}
 
+			let description = this.internalTrack.info.codecDescription;
+			if (this.internalTrack.info.codec === 'opus' && description
+				&& this.internalTrack.editListOffset > 0n
+				&& this.internalTrack.timescale === this.internalTrack.info.sampleRate) {
+				description = description.slice();
+				const view = new DataView(description.buffer, description.byteOffset, description.byteLength);
+				const preSkip = view.getUint16(10, true);
+				const overlap = Number(this.internalTrack.editListOffset) - preSkip;
+				if (overlap > 0 && overlap < preSkip) view.setUint16(10, preSkip - overlap, true);
+			}
+
 			return {
 				codec: extractAudioCodecString(this.internalTrack.info),
 				numberOfChannels: this.internalTrack.info.numberOfChannels,
 				sampleRate: this.internalTrack.info.sampleRate,
-				description: this.internalTrack.info.codecDescription ?? undefined,
+				description: description ?? undefined,
 			};
 		})();
 	}
