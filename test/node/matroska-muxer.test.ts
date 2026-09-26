@@ -165,8 +165,9 @@ for (const codec of ['aac', 'mp3', 'opus', 'pcm-s16'] as const) {
 	test(`Matroska exact ${codec} presentation writes signed padding and codec delay`, async () => {
 		const sampleRate = 48000;
 		const packetFrames = codec === 'aac' ? 1024 : codec === 'mp3' ? 1152 : codec === 'opus' ? 960 : 1000;
-		const delay = codec === 'opus' ? 312 : 24;
-		const frames = 2 * packetFrames - delay - 24;
+		// Priming can cover several packets, as the common 2112-sample AAC priming does
+		const delay = codec === 'opus' ? 312 : packetFrames + 24;
+		const frames = 3 * packetFrames - delay - 24;
 		const source = new EncodedAudioPacketSource(codec);
 		const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
 		const opusHead = new Uint8Array(19);
@@ -180,7 +181,7 @@ for (const codec of ['aac', 'mp3', 'opus', 'pcm-s16'] as const) {
 		};
 		output.addAudioTrack(source, { presentationTimestamp: 0, presentationDuration: frames / sampleRate });
 		await output.start();
-		for (let i = 0; i < 2; i++) {
+		for (let i = 0; i < 3; i++) {
 			const payload = codec === 'mp3'
 				? new Uint8Array(576)
 				: codec === 'pcm-s16' ? new Uint8Array(packetFrames * 2) : new Uint8Array([0xf8, 0]);
@@ -192,8 +193,9 @@ for (const codec of ['aac', 'mp3', 'opus', 'pcm-s16'] as const) {
 		}
 		await output.finalize();
 		const bytes = new Uint8Array(output.target.buffer!);
-		expect(readMatroskaIntegers(bytes, EBMLId.DiscardPadding))
-			.toEqual(codec === 'opus' ? [500000] : [-500000, 500000]);
+		expect(readMatroskaIntegers(bytes, EBMLId.DiscardPadding)).toEqual(codec === 'opus'
+			? [500000]
+			: [-Math.round(1e9 * packetFrames / sampleRate), -500000, 500000]);
 		expect(readMatroskaIntegers(bytes, EBMLId.CodecDelay)).toEqual(codec === 'opus' ? [6500000] : []);
 		expect(readMatroskaIntegers(bytes, EBMLId.SeekPreRoll)).toEqual(codec === 'opus' ? [80000000] : []);
 	});

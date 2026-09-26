@@ -14,6 +14,7 @@ import {
 	UNDETERMINED_LANGUAGE,
 	assert,
 	assertNever,
+	clamp,
 	colorSpaceIsEmpty,
 	extractRotationFromMatrix,
 	imageMimeTypeToExtension,
@@ -1134,6 +1135,10 @@ export class MatroskaMuxer extends Muxer {
 				timestamp = presentation.timestamp - headTimestampOffset
 					+ presentation.nextCodedSample / presentation.sampleRate;
 				duration = durationInSamples / presentation.sampleRate;
+				// DiscardPadding trims only its own block, so the head trim pads the start of every block it covers
+				const headPaddingInSamples = track.source._codec === 'opus'
+					? 0
+					: clamp(presentation.codecDelayInSamples - presentation.nextCodedSample, 0, durationInSamples);
 				presentation.nextCodedSample += durationInSamples;
 
 				const targetCodedEnd = presentation.codecDelayInSamples + presentation.durationInSamples;
@@ -1144,16 +1149,12 @@ export class MatroskaMuxer extends Muxer {
 				discardPaddingNs = Math.round(
 					1e9 * discardPaddingInSamples / presentation.sampleRate,
 				);
-				if (
-					isFirstPacket
-					&& track.source._codec !== 'opus'
-					&& presentation.codecDelayInSamples > 0
-				) {
+				if (headPaddingInSamples > 0) {
 					if (discardPaddingNs !== 0) {
 						throw new TypeError('One Matroska block cannot discard padding from both ends.');
 					}
 					discardPaddingNs = -Math.round(
-						1e9 * presentation.codecDelayInSamples / presentation.sampleRate,
+						1e9 * headPaddingInSamples / presentation.sampleRate,
 					);
 				}
 			}
