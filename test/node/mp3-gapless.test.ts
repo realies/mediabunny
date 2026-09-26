@@ -63,3 +63,18 @@ test('LAME padding past the start of the last frame separates presentation from 
 	expect(await track.computeDuration()).toBe(1180 / 48000);
 	expect(await track.getDurationFromMetadata()).toBe(1180 / 48000);
 });
+
+test('LAME delay and padding beyond the counted frames count as absent', async () => {
+	const bytes = new Uint8Array(576 * 2);
+	for (let i = 0; i < 2; i++) bytes.set([0xff, 0xfb, 0xb4, 0], i * 576);
+	bytes.set([0x58, 0x69, 0x6e, 0x67, 0, 0, 0, 1, 0, 0, 0, 1], 36); // Xing, one coded audio frame
+	bytes.set([0x4c, 0x41, 0x4d, 0x45], 48); // LAME
+	bytes.set([0x24, 0x06, 0xa4], 48 + 21); // Delay 576, padding 1700: more than the frame's 1152 samples
+	using input = new Input({ source: new BufferSource(bytes), formats: [MP3] });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	const packet = await new EncodedPacketSink(track).getFirstPacket();
+	expect(packet?.timestamp).toBe(0);
+	expect(packet?.duration).toBe(1152 / 48000);
+	expect(await track.getDurationFromMetadata()).toBe(1152 / 48000);
+});

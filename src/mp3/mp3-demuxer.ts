@@ -231,16 +231,10 @@ export class Mp3Demuxer extends Demuxer {
 		// is the demuxer's to add, exactly where ffmpeg's mp3 demuxer adds it. The end
 		// discard thus becomes padding − 529; a padding below 529 comes out short by
 		// the difference, identically to the reference decoder.
-		const timelineShiftInSamples = this.xingData?.encoderDelay != null
-			? this.xingData.encoderDelay + MP3_DECODER_DELAY_IN_SAMPLES
-			: 0;
-		const declaredEndInSamples = this.xingData
-			&& this.xingData.frameCount !== null
-			&& this.xingData.encoderDelay !== null
-			&& this.xingData.encoderPadding !== null
-			? this.xingData.frameCount * header.audioSamplesInFrame
-			- this.xingData.encoderDelay
-			- this.xingData.encoderPadding
+		const gapless = this.getGaplessDeclaration();
+		const timelineShiftInSamples = gapless ? gapless.delay + MP3_DECODER_DELAY_IN_SAMPLES : 0;
+		const declaredEndInSamples = gapless && this.xingData?.frameCount != null
+			? this.xingData.frameCount * header.audioSamplesInFrame - gapless.delay - gapless.padding
 			: null;
 
 		const startInSamples = this.nextTimestampInSamples - timelineShiftInSamples;
@@ -260,6 +254,29 @@ export class Mp3Demuxer extends Demuxer {
 		this.nextTimestampInSamples += header.audioSamplesInFrame;
 
 		return;
+	}
+
+	/**
+	 * The encoder delay and padding the LAME tag declares, or null if it declares none. Delay and padding that
+	 * together exceed the samples of the frames the Xing header counts are inconsistent, so they count as absent too
+	 * and the timing stays untrimmed.
+	 */
+	getGaplessDeclaration() {
+		assert(this.firstFrameHeader);
+
+		const xingData = this.xingData;
+		if (!xingData || xingData.encoderDelay === null || xingData.encoderPadding === null) {
+			return null;
+		}
+
+		const totalSamples = xingData.frameCount !== null
+			? xingData.frameCount * this.firstFrameHeader.audioSamplesInFrame
+			: Infinity;
+		if (xingData.encoderDelay + xingData.encoderPadding > totalSamples) {
+			return null;
+		}
+
+		return { delay: xingData.encoderDelay, padding: xingData.encoderPadding };
 	}
 
 	async getMimeType() {
@@ -376,10 +393,8 @@ class Mp3AudioTrackBacking implements InputAudioTrackBacking {
 				const totalSamples = demuxer.xingData.frameCount * demuxer.firstFrameHeader.audioSamplesInFrame;
 				// With a gapless declaration the timeline is shifted by -delay and
 				// ends at the declared stream length.
-				const trimmedSamples = demuxer.xingData.encoderDelay !== null
-					&& demuxer.xingData.encoderPadding !== null
-					? totalSamples - demuxer.xingData.encoderDelay - demuxer.xingData.encoderPadding
-					: totalSamples;
+				const gapless = demuxer.getGaplessDeclaration();
+				const trimmedSamples = gapless ? totalSamples - gapless.delay - gapless.padding : totalSamples;
 
 				return trimmedSamples / demuxer.firstFrameHeader.sampleRate;
 			}
