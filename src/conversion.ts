@@ -11,6 +11,7 @@ import {
 	AudioCodec,
 	MediaCodec,
 	NON_PCM_AUDIO_CODECS,
+	OPUS_SAMPLE_RATE,
 	VIDEO_CODECS,
 	VideoCodec,
 } from './codec';
@@ -2227,7 +2228,7 @@ export class Conversion {
 				const config = await track.getDecoderConfig();
 				assert(config?.description);
 				const preSkip = parseOpusIdentificationHeader(toUint8Array(config.description)).preSkip;
-				codecDelay = preSkip / config.sampleRate;
+				codecDelay = preSkip / OPUS_SAMPLE_RATE;
 				headTrimDuration = Math.max(this._startTimestamp - firstTimestamp - codecDelay, 0);
 			}
 
