@@ -598,9 +598,13 @@ const findBtrtBoxes = (bytes: Uint8Array) => {
 	return boxes;
 };
 
-for (const codec of ['aac', 'opus'] as const) {
-	test(`Exact ${codec} presentation writes edits without changing packet payloads`, async () => {
+// Sources place Opus PreSkip differently: ISOBMFF starts the first packet at -PreSkip, Ogg clamps it to zero, and
+// encoders leave it out of every timestamp.
+for (const [codec, timeline] of [['aac', 'coded'], ['opus', 'coded'], ['opus', 'ogg'], ['opus', 'encoder']] as const) {
+	test(`Exact ${codec} presentation writes edits without changing packet payloads (${timeline})`, async () => {
 		const sampleRate = 48000;
+		// An encoder may report a lower Opus rate, but PreSkip and packet durations still count 48 kHz samples
+		const configSampleRate = timeline === 'encoder' ? 24000 : sampleRate;
 		const preSkip = codec === 'opus' ? 312 : 1024;
 		const packetFrames = codec === 'opus' ? 960 : 1024;
 		const frames = codec === 'opus' ? 4800 : 1000;
@@ -609,7 +613,7 @@ for (const codec of ['aac', 'opus'] as const) {
 		opusHead.set([79, 112, 117, 115, 72, 101, 97, 100, 1, 2]);
 		new DataView(opusHead.buffer).setUint16(10, preSkip, true);
 		const decoderConfig = {
-			codec: codec === 'opus' ? 'opus' : 'mp4a.40.2', numberOfChannels: 2, sampleRate,
+			codec: codec === 'opus' ? 'opus' : 'mp4a.40.2', numberOfChannels: 2, sampleRate: configSampleRate,
 			description: codec === 'opus' ? opusHead : new Uint8Array([0x11, 0x90]),
 		};
 		const source = new EncodedAudioPacketSource(codec);
@@ -618,9 +622,8 @@ for (const codec of ['aac', 'opus'] as const) {
 		await output.start();
 		const payload = new Uint8Array([0xf8, 0]);
 		for (let i = 0; i < 6; i++) {
-			const timestamp = codec === 'opus' && i === 0
-				? 0
-				: presentationTimestamp + (i * packetFrames - preSkip) / sampleRate;
+			const delay = timeline === 'encoder' || (timeline === 'ogg' && i === 0) ? 0 : preSkip;
+			const timestamp = presentationTimestamp + (i * packetFrames - delay) / sampleRate;
 			await source.add(
 				new EncodedPacket(payload, 'key', timestamp, packetFrames / sampleRate), { decoderConfig },
 			);
@@ -633,7 +636,10 @@ for (const codec of ['aac', 'opus'] as const) {
 		expect(count).toBe(presentationTimestamp > 0 ? 2 : 1);
 		const content = elst + 12 + (count - 1) * 12;
 		expect(bytes.readUInt32BE(content)).toBe(frames * 57600 / sampleRate);
-		expect(bytes.readInt32BE(content + 4)).toBe(preSkip);
+		expect(bytes.readInt32BE(content + 4)).toBe(preSkip * configSampleRate / sampleRate);
+		const stts = bytes.indexOf('stts');
+		expect(bytes.readUInt32BE(stts + 8)).toBe(1); // A single entry, so no packet carries a gap
+		expect(bytes.readUInt32BE(stts + 16)).toBe(packetFrames * configSampleRate / sampleRate);
 		if (codec === 'opus') {
 			expect(bytes.indexOf('dOps')).toBeGreaterThan(0);
 			expect(bytes.indexOf('sgpd')).toBeGreaterThan(0);

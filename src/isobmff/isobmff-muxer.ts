@@ -38,6 +38,7 @@ import { IsobmffOutputFormatOptions, IsobmffOutputFormat, MovOutputFormat, CmafO
 import { inlineTimestampRegex, SubtitleConfig, SubtitleCue, SubtitleMetadata } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
 import {
+	OPUS_SAMPLE_RATE,
 	parsePcmCodec,
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
@@ -154,8 +155,8 @@ export type IsobmffTrackData = {
 			timestamp: number;
 			duration: number;
 			trimStart: number;
+			nextCodedSample: number;
 		} | null;
-		packetsReceived: number;
 	};
 } | {
 	track: OutputSubtitleTrack;
@@ -605,8 +606,7 @@ export class IsobmffMuxer extends Muxer {
 				if (!description) {
 					throw new TypeError('Exact Opus presentation metadata requires an Opus identification header.');
 				}
-				trimStart = parseOpusIdentificationHeader(toUint8Array(description)).preSkip
-					/ meta.decoderConfig.sampleRate;
+				trimStart = parseOpusIdentificationHeader(toUint8Array(description)).preSkip / OPUS_SAMPLE_RATE;
 			}
 
 			if (trimStart < 0) {
@@ -616,6 +616,7 @@ export class IsobmffMuxer extends Muxer {
 				timestamp: track.metadata.presentationTimestamp,
 				duration: track.metadata.presentationDuration!,
 				trimStart,
+				nextCodedSample: 0,
 			};
 		}
 
@@ -634,7 +635,6 @@ export class IsobmffMuxer extends Muxer {
 				requiresAdtsStripping,
 				primingPacket: packet,
 				presentation,
-				packetsReceived: 0,
 			},
 			timescale: decoderConfig.sampleRate,
 			samples: [],
@@ -776,16 +776,17 @@ export class IsobmffMuxer extends Muxer {
 
 			let timestamp = packet.timestamp;
 			let duration = packet.duration;
-			if (trackData.info.presentation && track.source._codec === 'opus') {
-				// Ogg exposes Opus packet timestamps on the decoded presentation timeline. ISOBMFF stores the raw coded
-				// timeline. Moving the first packet back by PreSkip restores the
-				// same constant packet cadence already carried by every later timestamp.
-				if (trackData.info.packetsReceived === 0) {
-					timestamp -= trackData.info.presentation.trimStart;
-				}
-				duration = parseOpusTocByte(packetData).durationInSamples / trackData.info.sampleRate;
+			const presentation = trackData.info.presentation;
+			if (presentation && track.source._codec === 'opus') {
+				// Sources place Opus PreSkip differently (ISOBMFF starts the first packet at -PreSkip, Ogg clamps it to
+				// zero, encoders leave it out of every timestamp), so the raw coded timeline is rebuilt from the TOC
+				// durations, starting PreSkip before the presentation timestamp.
+				const durationInSamples = parseOpusTocByte(packetData).durationInSamples;
+				timestamp = presentation.timestamp - presentation.trimStart
+					+ presentation.nextCodedSample / OPUS_SAMPLE_RATE;
+				duration = durationInSamples / OPUS_SAMPLE_RATE;
+				presentation.nextCodedSample += durationInSamples;
 			}
-			trackData.info.packetsReceived++;
 
 			this.validateTimestamp(
 				trackData.track,

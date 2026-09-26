@@ -173,7 +173,9 @@ for (const codec of ['aac', 'mp3', 'opus', 'pcm-s16'] as const) {
 		opusHead.set([79, 112, 117, 115, 72, 101, 97, 100, 1, 1]);
 		new DataView(opusHead.buffer).setUint16(10, delay, true);
 		const decoderConfig = {
-			codec: codec === 'aac' ? 'mp4a.40.2' : codec, numberOfChannels: 1, sampleRate,
+			codec: codec === 'aac' ? 'mp4a.40.2' : codec, numberOfChannels: 1,
+			// An encoder may report a lower Opus rate, but PreSkip and packet durations still count 48 kHz samples
+			sampleRate: codec === 'opus' ? 24000 : sampleRate,
 			description: codec === 'opus' ? opusHead : codec === 'aac' ? new Uint8Array([0x11, 0x88]) : undefined,
 		};
 		output.addAudioTrack(source, { presentationTimestamp: 0, presentationDuration: frames / sampleRate });

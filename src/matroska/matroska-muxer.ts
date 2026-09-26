@@ -57,6 +57,7 @@ import {
 } from '../subtitles';
 import { aacChannelMap, aacFrequencyTable, buildAacAudioSpecificConfig } from '../../shared/aac-misc';
 import {
+	OPUS_SAMPLE_RATE,
 	PCM_AUDIO_CODECS,
 	PcmAudioCodec,
 	SubtitleCodec,
@@ -125,6 +126,8 @@ type MatroskaTrackData = {
 		requiresAdtsStripping: boolean;
 		presentation: {
 			timestamp: number;
+			/** The rate of every sample count below: Opus counts at 48 kHz, whatever the decoder config reports. */
+			sampleRate: number;
 			durationInSamples: number;
 			codecDelayInSamples: number;
 			nextCodedSample: number;
@@ -353,7 +356,7 @@ export class MatroskaMuxer extends Muxer {
 				&& trackData.info.presentation
 			) {
 				codecDelayNs = Math.round(
-					1e9 * trackData.info.presentation.codecDelayInSamples / trackData.info.sampleRate,
+					1e9 * trackData.info.presentation.codecDelayInSamples / trackData.info.presentation.sampleRate,
 				);
 			}
 
@@ -937,6 +940,7 @@ export class MatroskaMuxer extends Muxer {
 
 		let presentation: MatroskaAudioTrackData['info']['presentation'] = null;
 		if (track.metadata.presentationTimestamp !== undefined) {
+			const sampleRate = track.source._codec === 'opus' ? OPUS_SAMPLE_RATE : meta.decoderConfig.sampleRate;
 			let codecDelayInSamples: number;
 			if (track.source._codec === 'opus') {
 				const description = decoderConfig.description;
@@ -947,18 +951,19 @@ export class MatroskaMuxer extends Muxer {
 			} else {
 				codecDelayInSamples = Math.round(
 					(track.metadata.presentationTimestamp - (packet?.timestamp ?? track.metadata.presentationTimestamp))
-					* meta.decoderConfig.sampleRate,
+					* sampleRate,
 				);
 			}
 
 			const durationInSamples = Math.round(
-				track.metadata.presentationDuration! * meta.decoderConfig.sampleRate,
+				track.metadata.presentationDuration! * sampleRate,
 			);
 			if (codecDelayInSamples < 0 || durationInSamples < 0) {
 				throw new TypeError('The exact audio presentation interval is outside the coded sample timeline.');
 			}
 			presentation = {
 				timestamp: track.metadata.presentationTimestamp,
+				sampleRate,
 				durationInSamples,
 				codecDelayInSamples,
 				nextCodedSample: 0,
@@ -1096,7 +1101,7 @@ export class MatroskaMuxer extends Muxer {
 				const isFirstPacket = presentation.nextCodedSample === 0;
 				if (isFirstPacket && track.source._codec !== 'opus') {
 					presentation.codecDelayInSamples = Math.round(
-						(presentation.timestamp - packet.timestamp) * trackData.info.sampleRate,
+						(presentation.timestamp - packet.timestamp) * presentation.sampleRate,
 					);
 					if (presentation.codecDelayInSamples < 0) {
 						throw new TypeError('The exact audio presentation begins before the coded sample span.');
@@ -1105,7 +1110,7 @@ export class MatroskaMuxer extends Muxer {
 				let durationInSamples: number;
 				if (track.source._codec === 'aac') {
 					durationInSamples = presentation.aacPacketDurationInSamples
-						??= Math.round(packet.duration * trackData.info.sampleRate);
+						??= Math.round(packet.duration * presentation.sampleRate);
 				} else if (track.source._codec === 'mp3') {
 					if (packetData.byteLength < 4) {
 						throw new TypeError('MP3 packet is too short to contain a frame header.');
@@ -1117,15 +1122,15 @@ export class MatroskaMuxer extends Muxer {
 				} else if (track.source._codec === 'opus') {
 					durationInSamples = parseOpusTocByte(packetData).durationInSamples;
 				} else {
-					durationInSamples = Math.round(packet.duration * trackData.info.sampleRate);
+					durationInSamples = Math.round(packet.duration * presentation.sampleRate);
 				}
 
 				const headTimestampOffset = track.source._codec === 'opus'
 					? 0
-					: presentation.codecDelayInSamples / trackData.info.sampleRate;
+					: presentation.codecDelayInSamples / presentation.sampleRate;
 				timestamp = presentation.timestamp - headTimestampOffset
-					+ presentation.nextCodedSample / trackData.info.sampleRate;
-				duration = durationInSamples / trackData.info.sampleRate;
+					+ presentation.nextCodedSample / presentation.sampleRate;
+				duration = durationInSamples / presentation.sampleRate;
 				presentation.nextCodedSample += durationInSamples;
 
 				const targetCodedEnd = presentation.codecDelayInSamples + presentation.durationInSamples;
@@ -1134,7 +1139,7 @@ export class MatroskaMuxer extends Muxer {
 					throw new TypeError('The exact audio presentation interval ends before this packet.');
 				}
 				discardPaddingNs = Math.round(
-					1e9 * discardPaddingInSamples / trackData.info.sampleRate,
+					1e9 * discardPaddingInSamples / presentation.sampleRate,
 				);
 				if (
 					isFirstPacket
@@ -1145,7 +1150,7 @@ export class MatroskaMuxer extends Muxer {
 						throw new TypeError('One Matroska block cannot discard padding from both ends.');
 					}
 					discardPaddingNs = -Math.round(
-						1e9 * presentation.codecDelayInSamples / trackData.info.sampleRate,
+						1e9 * presentation.codecDelayInSamples / presentation.sampleRate,
 					);
 				}
 			}
