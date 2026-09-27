@@ -396,12 +396,7 @@ export const mvhd = (
 		0,
 		...trackDatas
 			.map(trackData => (
-				// Round separately to match the edit list
-				Math.max(
-					0,
-					intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
-					+ intoTimescale(trackData.startTimestampOffset ?? 0, GLOBAL_TIMESCALE),
-				)
+				trackPresentationEnd(trackData)
 			)),
 	);
 	const nextTrackId = Math.max(0, ...trackDatas.map(x => x.track.id)) + 1;
@@ -431,7 +426,8 @@ export const mvhd = (
  */
 export const trak = (trackData: IsobmffTrackData, creationTime: number) => {
 	const trackMetadata = getTrackMetadata(trackData);
-	const needsEditList = trackData.startTimestampOffset !== null && trackData.startTimestampOffset !== 0;
+	const needsEditList = (trackData.type === 'audio' && trackData.info.presentation !== null)
+		|| (trackData.startTimestampOffset !== null && trackData.startTimestampOffset !== 0);
 
 	return box('trak', undefined, [
 		tkhd(trackData, creationTime),
@@ -452,12 +448,7 @@ export const tkhd = (
 	trackData: IsobmffTrackData,
 	creationTime: number,
 ) => {
-	// Round separately to match the edit list
-	const durationInGlobalTimescale = Math.max(
-		0,
-		intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
-		+ intoTimescale(trackData.startTimestampOffset ?? 0, GLOBAL_TIMESCALE),
-	);
+	const durationInGlobalTimescale = trackPresentationEnd(trackData);
 
 	const needsU64 = !isU32(creationTime) || !isU32(durationInGlobalTimescale);
 	const u32OrU64 = needsU64 ? u64 : u32;
@@ -512,64 +503,43 @@ export const tkhd = (
 	]);
 };
 
+const trackPresentationEnd = (trackData: IsobmffTrackData) => {
+	const presentation = trackData.type === 'audio' ? trackData.info.presentation : null;
+	// Round separately to match the edit list.
+	return presentation
+		? intoTimescale(presentation.timestamp, GLOBAL_TIMESCALE)
+		+ intoTimescale(presentation.duration, GLOBAL_TIMESCALE)
+		: Math.max(0, intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
+		+ intoTimescale(trackData.startTimestampOffset ?? 0, GLOBAL_TIMESCALE));
+};
+
 /** Edit Box: Specifies edits to the track's media. */
 export const edts = (trackData: IsobmffTrackData) => {
-	const offset = trackData.startTimestampOffset;
+	const presentation = trackData.type === 'audio' ? trackData.info.presentation : null;
+	const offset = presentation?.timestamp ?? trackData.startTimestampOffset;
 	assert(offset !== null);
-
-	if (offset > 0) {
-		// Positive offset: empty segment at the start, then the full media afterwards
-
-		const startOffset = intoTimescale(offset, GLOBAL_TIMESCALE);
-		const mediaDuration = intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE);
-
-		const needs64Bits = !isU32(startOffset) || !isU32(mediaDuration);
-		const u32OrU64 = needs64Bits ? u64 : u32;
-		const i32OrI64 = needs64Bits ? i64 : i32;
-
-		return box('edts', undefined, [
-			fullBox('elst', needs64Bits ? 1 : 0, 0, [
-				u32(2), // Entry count
-
-				// #1
-				u32OrU64(startOffset), // Segment duration
-				i32OrI64(-1), // Media time
-				fixed_16_16(1), // Media rate
-
-				// #2
-				u32OrU64(mediaDuration), // Segment duration
-				i32OrI64(0), // Media time
-				fixed_16_16(1), // Media rate
-			]),
-		]);
-	} else {
-		// Negative offset: the negative section of the media is trimmed off
-
-		const mediaTime = intoTimescale(-offset, trackData.timescale);
-		// Not the entire media is visible.
-		// For fragmented files, this value is zero, which simply means "unknown duration" in this case. Spec:
-		// "the segment_duration of this edit may be zero"
-		const mediaDuration = Math.max(
-			0,
-			intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
-			+ intoTimescale(offset, GLOBAL_TIMESCALE),
-		);
-
-		const needs64Bits = !isI32(mediaTime) || !isU32(mediaDuration);
-		const u32OrU64 = needs64Bits ? u64 : u32;
-		const i32OrI64 = needs64Bits ? i64 : i32;
-
-		return box('edts', undefined, [
-			fullBox('elst', needs64Bits ? 1 : 0, 0, [
-				u32(1), // Entry count
-
-				// #1
-				u32OrU64(mediaDuration), // Segment duration
-				i32OrI64(mediaTime), // Media time
-				fixed_16_16(1), // Media rate
-			]),
-		]);
-	}
+	const startOffset = Math.max(intoTimescale(offset, GLOBAL_TIMESCALE), 0);
+	// A zero duration in a fragmented initialization segment supplies the offset without declaring an end.
+	const mediaDuration = presentation
+		? intoTimescale(presentation.duration, GLOBAL_TIMESCALE)
+		: Math.max(0, intoTimescale(presentationSpan(trackData), GLOBAL_TIMESCALE)
+		+ Math.min(intoTimescale(offset, GLOBAL_TIMESCALE), 0));
+	const mediaTime = intoTimescale(
+		presentation ? presentation.timestamp - trackData.startTimestampOffset! : Math.max(-offset, 0),
+		trackData.timescale,
+	);
+	const needs64Bits = !isU32(startOffset) || !isU32(mediaDuration) || !isI32(mediaTime);
+	const u32OrU64 = needs64Bits ? u64 : u32;
+	const i32OrI64 = needs64Bits ? i64 : i32;
+	return box('edts', undefined, [
+		fullBox('elst', needs64Bits ? 1 : 0, 0, [
+			u32(startOffset > 0 ? 2 : 1),
+			...(startOffset > 0 ? [u32OrU64(startOffset), i32OrI64(-1), fixed_16_16(1)] : []),
+			u32OrU64(mediaDuration),
+			i32OrI64(mediaTime),
+			fixed_16_16(1),
+		]),
+	]);
 };
 
 /** Media Box: Describes and define a track's media type and sample data. */
@@ -689,6 +659,7 @@ export const url = () => fullBox('url ', 0, 1); // Self-reference flag enabled
 export const stbl = (trackData: IsobmffTrackData) => {
 	const needsCtts = trackData.compositionTimeOffsetTable.length > 1
 		|| trackData.compositionTimeOffsetTable.some(x => x.sampleCompositionTimeOffset !== 0);
+	const rollGroups = opusRollSampleGroups(trackData);
 
 	return box('stbl', undefined, [
 		stsd(trackData),
@@ -699,8 +670,75 @@ export const stbl = (trackData: IsobmffTrackData) => {
 		stsz(trackData),
 		stco(trackData),
 		stss(trackData),
+		rollGroups ? sgpd(rollGroups) : null,
+		rollGroups ? sbgp(rollGroups) : null,
 	]);
 };
+
+type RollSampleGroups = {
+	descriptions: number[];
+	runs: {
+		sampleCount: number;
+		groupDescriptionIndex: number;
+		rollDistance: number;
+	}[];
+};
+
+const opusRollSampleGroups = (trackData: IsobmffTrackData): RollSampleGroups | null => {
+	if (trackData.type !== 'audio' || trackData.track.source._codec !== 'opus' || trackData.samples.length === 0) {
+		return null;
+	}
+
+	const seekPreRollSamples = intoTimescale(0.08, trackData.timescale);
+	const descriptions: number[] = [];
+	const runs: RollSampleGroups['runs'] = [];
+
+	for (let i = 0; i < trackData.samples.length; i++) {
+		let samplesRemaining = seekPreRollSamples;
+		let distance = 0;
+		for (let j = i - 1; j >= 0; j--) {
+			samplesRemaining -= trackData.samples[j]!.timescaleUnitsToNextSample;
+			distance++;
+			if (samplesRemaining <= 0) {
+				break;
+			}
+		}
+		if (samplesRemaining > 0) {
+			distance = 0;
+		}
+		if (distance > 32) {
+			throw new Error('Opus roll recovery requires more than 32 preceding packets.');
+		}
+
+		const previousRun = last(runs);
+		if (previousRun?.rollDistance === distance) {
+			previousRun.sampleCount++;
+		} else {
+			const groupDescriptionIndex = distance ? descriptions.push(-distance) : 0;
+			runs.push({ sampleCount: 1, groupDescriptionIndex, rollDistance: distance });
+		}
+	}
+
+	return descriptions.length > 0 ? { descriptions, runs } : null;
+};
+
+/** Sample Group Description Box: describes Opus roll-recovery distance for independent decoding. */
+export const sgpd = (groups: RollSampleGroups) => fullBox('sgpd', 1, 0, [
+	ascii('roll'),
+	u32(2), // Default description length
+	u32(groups.descriptions.length),
+	groups.descriptions.map(i16),
+]);
+
+/** Sample To Group Box: maps each Opus packet to its roll-recovery description. */
+export const sbgp = (groups: RollSampleGroups) => fullBox('sbgp', 0, 0, [
+	ascii('roll'),
+	u32(groups.runs.length),
+	groups.runs.map(run => [
+		u32(run.sampleCount),
+		u32(run.groupDescriptionIndex),
+	]),
+]);
 
 /**
  * Sample Description Box: Stores information that allows you to decode samples in the media. The data stored in the

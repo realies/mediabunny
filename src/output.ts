@@ -327,6 +327,20 @@ export type AudioTrackMetadata = BaseTrackMetadata & {
 	 * not included in the decoder config. This packet will not be added to the media data.
 	 */
 	primingPacket?: EncodedPacket;
+	/**
+	 * The timestamp at which the first non-padding decoded audio sample must be presented. When set,
+	 * {@link AudioTrackMetadata.presentationDuration} must also be set.
+	 *
+	 * Encoded audio commonly contains decoder priming before this timestamp. Container muxers that support exact
+	 * audio presentation windows use this value to author their native delay/trim metadata without changing packets.
+	 */
+	presentationTimestamp?: number;
+	/**
+	 * The exact duration, in seconds, of non-padding decoded audio beginning at
+	 * {@link AudioTrackMetadata.presentationTimestamp}. When set, {@link AudioTrackMetadata.presentationTimestamp}
+	 * must also be set.
+	 */
+	presentationDuration?: number;
 };
 /**
  * Additional metadata for subtitle tracks.
@@ -739,6 +753,23 @@ export class Output<
 			if (metadata.decoderConfig === undefined) {
 				throw new TypeError('metadata.primingPacket can only be provided alongside metadata.decoderConfig.');
 			}
+		}
+		if ((metadata.presentationTimestamp === undefined) !== (metadata.presentationDuration === undefined)) {
+			throw new TypeError(
+				'metadata.presentationTimestamp and metadata.presentationDuration must both be provided or omitted.',
+			);
+		}
+		if (
+			metadata.presentationTimestamp !== undefined
+			&& (!Number.isFinite(metadata.presentationTimestamp) || metadata.presentationTimestamp < 0)
+		) {
+			throw new TypeError('metadata.presentationTimestamp, when provided, must be a non-negative finite number.');
+		}
+		if (
+			metadata.presentationDuration !== undefined
+			&& (!Number.isFinite(metadata.presentationDuration) || metadata.presentationDuration < 0)
+		) {
+			throw new TypeError('metadata.presentationDuration, when provided, must be a non-negative finite number.');
 		}
 
 		const metadataCopy = { ...metadata };

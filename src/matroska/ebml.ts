@@ -120,6 +120,7 @@ export enum EBMLId {
 	BlockAdditional = 0xa5,
 	BlockAddID = 0xee,
 	BlockDuration = 0x9b,
+	DiscardPadding = 0x75a2,
 	ReferenceBlock = 0xfb,
 	Cluster = 0x1f43b675,
 	Timestamp = 0xe7,

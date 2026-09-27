@@ -597,3 +597,88 @@ const findBtrtBoxes = (bytes: Uint8Array) => {
 
 	return boxes;
 };
+
+// Sources place Opus PreSkip differently: ISOBMFF starts the first packet at -PreSkip, Ogg clamps it to zero, and
+// encoders leave it out of every timestamp.
+for (const [codec, timeline] of [['aac', 'coded'], ['opus', 'coded'], ['opus', 'ogg'], ['opus', 'encoder']] as const) {
+	test(`Exact ${codec} presentation writes edits without changing packet payloads (${timeline})`, async () => {
+		const sampleRate = 48000;
+		// An encoder may report a lower Opus rate, but PreSkip and packet durations still count 48 kHz samples
+		const configSampleRate = timeline === 'encoder' ? 24000 : sampleRate;
+		const preSkip = codec === 'opus' ? 312 : 1024;
+		const packetFrames = codec === 'opus' ? 960 : 1024;
+		const frames = codec === 'opus' ? 4800 : 1000;
+		const presentationTimestamp = codec === 'opus' ? 0 : 1;
+		const opusHead = new Uint8Array(19);
+		opusHead.set([79, 112, 117, 115, 72, 101, 97, 100, 1, 2]);
+		new DataView(opusHead.buffer).setUint16(10, preSkip, true);
+		const decoderConfig = {
+			codec: codec === 'opus' ? 'opus' : 'mp4a.40.2', numberOfChannels: 2, sampleRate: configSampleRate,
+			description: codec === 'opus' ? opusHead : new Uint8Array([0x11, 0x90]),
+		};
+		const source = new EncodedAudioPacketSource(codec);
+		const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+		output.addAudioTrack(source, { presentationTimestamp, presentationDuration: frames / sampleRate });
+		await output.start();
+		const payload = new Uint8Array([0xf8, 0]);
+		for (let i = 0; i < 6; i++) {
+			const delay = timeline === 'encoder' || (timeline === 'ogg' && i === 0) ? 0 : preSkip;
+			const timestamp = presentationTimestamp + (i * packetFrames - delay) / sampleRate;
+			await source.add(
+				new EncodedPacket(payload, 'key', timestamp, packetFrames / sampleRate), { decoderConfig },
+			);
+		}
+		await output.finalize();
+		const bytes = Buffer.from(output.target.buffer!);
+		const elst = bytes.indexOf('elst');
+		expect(elst).toBeGreaterThan(0);
+		const count = bytes.readUInt32BE(elst + 8);
+		expect(count).toBe(presentationTimestamp > 0 ? 2 : 1);
+		const content = elst + 12 + (count - 1) * 12;
+		expect(bytes.readUInt32BE(content)).toBe(frames * 57600 / sampleRate);
+		expect(bytes.readInt32BE(content + 4)).toBe(preSkip * configSampleRate / sampleRate);
+		const stts = bytes.indexOf('stts');
+		expect(bytes.readUInt32BE(stts + 8)).toBe(1); // A single entry, so no packet carries a gap
+		expect(bytes.readUInt32BE(stts + 16)).toBe(packetFrames * configSampleRate / sampleRate);
+		if (codec === 'opus') {
+			expect(bytes.indexOf('dOps')).toBeGreaterThan(0);
+			expect(bytes.indexOf('sgpd')).toBeGreaterThan(0);
+			expect(bytes.indexOf('sbgp')).toBeGreaterThan(0);
+		}
+		using input = new Input({ source: new BufferSource(bytes), formats: ALL_FORMATS });
+		const track = await input.getPrimaryAudioTrack();
+		assert(track);
+		const sink = new EncodedPacketSink(track);
+		for await (const packet of sink.packets()) expect(packet.data).toEqual(payload);
+		const lastPacket = await sink.getPacket(Infinity);
+		assert(lastPacket);
+		const presentedFrames = (lastPacket.timestamp + lastPacket.duration - presentationTimestamp) * sampleRate;
+		expect(Math.round(presentedFrames)).toBe(frames);
+	});
+}
+
+test('Exact audio presentation finalizes a long track without exceeding the argument limit', async () => {
+	const packetCount = 150001;
+	const sampleRate = 48000;
+	const source = new EncodedAudioPacketSource('aac');
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	output.addAudioTrack(source, {
+		presentationTimestamp: 0,
+		presentationDuration: (packetCount - 1) * 1024 / sampleRate,
+	});
+	await output.start();
+	const decoderConfig = {
+		codec: 'mp4a.40.2', sampleRate, numberOfChannels: 1, description: new Uint8Array([0x11, 0x88]),
+	};
+	for (let i = 0; i < packetCount; i++) {
+		await source.add(
+			new EncodedPacket(new Uint8Array([0]), 'key', (i - 1) * 1024 / sampleRate, 1024 / sampleRate),
+			{ decoderConfig },
+		);
+	}
+	await output.finalize();
+	using input = new Input({ formats: ALL_FORMATS, source: new BufferSource(output.target.buffer!) });
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+	expect(await track.computeDuration()).toBe((packetCount - 1) * 1024 / sampleRate);
+}, 10000);
