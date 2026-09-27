@@ -1421,7 +1421,11 @@ export class MatroskaMuxer extends Muxer {
 		}
 
 		this.startTimestamp = Math.min(this.startTimestamp, msTimestamp);
-		this.endTimestamp = Math.max(this.endTimestamp, msTimestamp + msDuration);
+		// Positive DiscardPadding cuts the end of the block from playback, so it doesn't count toward the duration
+		this.endTimestamp = Math.max(
+			this.endTimestamp,
+			msTimestamp + msDuration - Math.max(chunk.discardPaddingNs, 0) / 1e6,
+		);
 		trackData.lastWrittenMsTimestamp = msTimestamp;
 
 		if (!this.trackDatasInCurrentCluster.has(trackData)) {
