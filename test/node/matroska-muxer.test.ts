@@ -209,18 +209,20 @@ test('Matroska Segment duration leaves out discarded tail audio', async () => {
 	const trimmed = new EncodedAudioPacketSource('pcm-s16');
 	const other = new EncodedAudioPacketSource('pcm-s16');
 	const output = new Output({ format: new MkvOutputFormat(), target: new BufferTarget() });
-	// Two 20 ms blocks with a 5 ms tail trim present 35 ms, so the other track's end at 38 ms is the latest
-	output.addAudioTrack(trimmed, { presentationTimestamp: 0, presentationDuration: 0.035 });
+	// Two 1000-sample blocks with a 24-sample tail trim present 41.17 ms, though their whole-millisecond timestamps and
+	// durations add up to 42 ms, so the other track's end at 41.25 ms is the latest
+	const block = 1000 / 48000;
+	output.addAudioTrack(trimmed, { presentationTimestamp: 0, presentationDuration: 1976 / 48000 });
 	output.addAudioTrack(other);
 	await output.start();
 	for (let i = 0; i < 2; i++) {
-		await trimmed.add(new EncodedPacket(new Uint8Array(1920), 'key', i * 0.02, 0.02), { decoderConfig });
+		await trimmed.add(new EncodedPacket(new Uint8Array(2000), 'key', i * block, block), { decoderConfig });
 	}
-	await other.add(new EncodedPacket(new Uint8Array(3648), 'key', 0, 0.038), { decoderConfig });
+	await other.add(new EncodedPacket(new Uint8Array(3960), 'key', 0, 0.04125), { decoderConfig });
 	await output.finalize();
 
 	using input = new Input({ source: new BufferSource(output.target.buffer!), formats: ALL_FORMATS });
-	expect(await input.getDurationFromMetadata()).toBe(0.038);
+	expect(await input.getDurationFromMetadata()).toBe(0.04125);
 });
 
 // Matroska input rounds packet timestamps and durations to whole milliseconds, so exact presentation has to count each
