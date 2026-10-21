@@ -74,6 +74,9 @@ test('AAC encoding', async () => {
 	expect(await track.getNumberOfChannels()).toBe(channels);
 
 	const sink = new EncodedPacketSink(track);
+	const firstPacket = await sink.getFirstPacket();
+	assert(firstPacket);
+	expect(firstPacket.timestamp).toBe(-1024 / sampleRate);
 	let packetCount = 0;
 	for await (const packet of sink.packets()) {
 		expect(packet.type).toBe('key');
@@ -124,5 +127,5 @@ test('AAC with huge timestamps', async () => {
 	const firstPacket = await sink.getFirstPacket();
 	assert(firstPacket);
 
-	expect(firstPacket.timestamp).toBe(timestamp);
+	expect(firstPacket.timestamp).toBe(timestamp - 1024 / sampleRate);
 });

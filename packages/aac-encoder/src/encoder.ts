@@ -255,7 +255,7 @@ class AacEncoder extends CustomAudioEncoder {
 			const packet = new EncodedPacket(
 				data,
 				'key',
-				this.nextPacketTimestampInSamples / this.sampleRate,
+				p.pts / this.sampleRate,
 				p.duration / this.sampleRate,
 			);
 
