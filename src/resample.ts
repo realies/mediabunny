@@ -6,7 +6,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-import { assert } from './misc';
+import { assert, roundIfAlmostInteger } from './misc';
 import { AudioSample } from './sample';
 
 /**
@@ -21,6 +21,8 @@ export class AudioResampler {
 	sourceNumberOfChannels: number | null = null;
 	targetNumberOfChannels: number;
 	startTime: number | null = null;
+	previousInputEndTime: number | null = null;
+	previousSourceEndFrame = 0;
 	onSample: (sample: AudioSample) => Promise<void>;
 
 	bufferSizeInFrames: number;
@@ -207,11 +209,25 @@ export class AudioResampler {
 		audioSample.copyTo(sourceView, { planeIndex: 0, format: 'f32' });
 
 		const inputStartTime = audioSample.timestamp - this.startTime;
-		const inputEndTime = inputStartTime + audioSample.duration;
+		// AudioData timestamps are quantized to microseconds.
+		const contiguous = this.previousInputEndTime !== null && Math.abs(
+			audioSample.timestamp - this.previousInputEndTime,
+		) <= Math.max(1e-6, 10 * Number.EPSILON
+		* Math.max(Math.abs(audioSample.timestamp), Math.abs(this.previousInputEndTime)));
+		const inputStartFrame = contiguous
+			? this.previousSourceEndFrame
+			: roundIfAlmostInteger(inputStartTime * this.sourceSampleRate);
+		const inputEndFrame = inputStartFrame + audioSample.numberOfFrames;
+		this.previousInputEndTime = audioSample.timestamp + audioSample.duration;
+		this.previousSourceEndFrame = inputEndFrame;
 
-		// Compute which output frames are affected by this sample
-		const outputStartFrame = Math.floor((inputStartTime - 1 / this.sourceSampleRate) * this.targetSampleRate) + 1;
-		const outputEndFrame = Math.ceil(inputEndTime * this.targetSampleRate);
+		// Keep the source-frame phase, carrying exact frame counts across contiguous samples.
+		const outputStartFrame = Math.floor(roundIfAlmostInteger(
+			(inputStartFrame - 1) * this.targetSampleRate / this.sourceSampleRate,
+		)) + 1;
+		const outputEndFrame = Math.ceil(roundIfAlmostInteger(
+			inputEndFrame * this.targetSampleRate / this.sourceSampleRate,
+		));
 
 		for (let outputFrame = outputStartFrame; outputFrame < outputEndFrame; outputFrame++) {
 			if (outputFrame < this.bufferStartFrame) {
@@ -227,9 +243,7 @@ export class AudioResampler {
 			const bufferFrameIndex = outputFrame - this.bufferStartFrame;
 			assert(bufferFrameIndex < this.bufferCapacityInFrames);
 
-			const outputTime = outputFrame / this.targetSampleRate;
-			const inputTime = outputTime - inputStartTime;
-			const sourcePosition = inputTime * this.sourceSampleRate;
+			const sourcePosition = outputFrame * this.sourceSampleRate / this.targetSampleRate - inputStartFrame;
 
 			const sourceLowerFrame = Math.floor(sourcePosition);
 			const sourceUpperFrame = Math.ceil(sourcePosition);
