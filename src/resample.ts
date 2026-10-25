@@ -209,9 +209,11 @@ export class AudioResampler {
 		audioSample.copyTo(sourceView, { planeIndex: 0, format: 'f32' });
 
 		const inputStartTime = audioSample.timestamp - this.startTime;
+		// AudioData timestamps are quantized to microseconds.
 		const contiguous = this.previousInputEndTime !== null && Math.abs(
 			audioSample.timestamp - this.previousInputEndTime,
-		) <= 10 * Number.EPSILON * Math.max(Math.abs(audioSample.timestamp), Math.abs(this.previousInputEndTime));
+		) <= Math.max(1e-6, 10 * Number.EPSILON
+		* Math.max(Math.abs(audioSample.timestamp), Math.abs(this.previousInputEndTime)));
 		const inputStartFrame = contiguous
 			? this.previousSourceEndFrame
 			: roundIfAlmostInteger(inputStartTime * this.sourceSampleRate);

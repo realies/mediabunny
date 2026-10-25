@@ -42,7 +42,7 @@ test('Output buffer boundary with fractional chunk endpoint', async () => {
 	expect(output.slice(58, 63)).toEqual([0.75, 0.75, 0.75, 0.75, 0.75]);
 });
 
-test('Accumulated chunk durations do not add an output frame', async () => {
+test.each([false, true])('Accumulated chunk durations (microsecond-rounded: %s)', async (rounded) => {
 	let outputFrames = 0;
 	const resampler = new AudioResampler({
 		targetSampleRate: 48000,
@@ -59,7 +59,7 @@ test('Accumulated chunk durations do not add an output frame', async () => {
 			format: 'f32',
 			sampleRate: 44100,
 			numberOfChannels: 1,
-			timestamp,
+			timestamp: rounded ? Math.round(timestamp * 1e6) / 1e6 : timestamp,
 			data: new Float32Array(Math.min(1152, framesLeft)),
 		});
 		await resampler.add(sample);
