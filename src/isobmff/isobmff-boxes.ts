@@ -900,6 +900,25 @@ export const soundSampleDescription = (
 	let version = 0;
 	let contents: NestedNumberArray;
 	let sampleSizeInBits = 16;
+	let numberOfChannels = trackData.info.numberOfChannels;
+	let sampleRate = trackData.info.sampleRate;
+
+	if (trackData.track.source._codec === 'flac') {
+		const description = trackData.info.decoderConfig.description;
+		assert(description);
+
+		const bitstream = new Bitstream(toUint8Array(description));
+		bitstream.skipBits(8 * (4 + 4 + 10)); // 'fLaC', metadata block header, block/frame sizes
+		sampleRate = bitstream.readBits(20);
+		numberOfChannels = bitstream.readBits(3) + 1;
+		sampleSizeInBits = bitstream.readBits(5) + 1;
+
+		// FLAC-in-ISOBMFF requires the largest exact power-of-two division that fits in 16.16.
+		while (sampleRate > 65535 && sampleRate % 2 === 0) {
+			sampleRate /= 2;
+		}
+		sampleRate = Math.min(sampleRate, 65535);
+	}
 
 	const isPcmCodec = (PCM_AUDIO_CODECS as readonly AudioCodec[]).includes(trackData.track.source._codec);
 	if (isPcmCodec) {
@@ -912,8 +931,9 @@ export const soundSampleDescription = (
 		}
 	}
 
-	// TrueHD's sample entry is defined on top of version 0, with its own sample rate layout
-	if (trackData.muxer.isQuickTime && trackData.track.source._codec !== 'truehd') {
+	// FLAC and TrueHD sample entries are defined on top of version 0.
+	if (trackData.muxer.isQuickTime && trackData.track.source._codec !== 'truehd'
+		&& trackData.track.source._codec !== 'flac') {
 		version = 1;
 	}
 
@@ -924,14 +944,14 @@ export const soundSampleDescription = (
 			u16(version), // Version
 			u16(0), // Revision level
 			u32(0), // Vendor
-			u16(trackData.info.numberOfChannels), // Number of channels
+			u16(numberOfChannels), // Number of channels
 			u16(sampleSizeInBits), // Sample size (bits)
 			u16(0), // Compression ID
 			u16(0), // Packet size
 			trackData.track.source._codec === 'truehd'
 				? u32(trackData.info.sampleRate) // TrueHD stores the sample rate as a plain integer
 				: [
-						u16(trackData.info.sampleRate < 2 ** 16 ? trackData.info.sampleRate : 0), // Sample rate (upper)
+						u16(sampleRate < 2 ** 16 ? sampleRate : 0), // Sample rate (upper)
 						u16(0), // Sample rate (lower)
 					],
 		];

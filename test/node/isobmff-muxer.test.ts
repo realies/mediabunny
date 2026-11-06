@@ -7,13 +7,87 @@ import { ADTS, ALL_FORMATS } from '../../src/input-format.js';
 import { EncodedPacketSink } from '../../src/media-sink.js';
 import { Output } from '../../src/output.js';
 import { BufferTarget } from '../../src/target.js';
-import { Mp4OutputFormat } from '../../src/output-format.js';
+import { MovOutputFormat, Mp4OutputFormat } from '../../src/output-format.js';
 import { Conversion } from '../../src/conversion.js';
 import { assert, toDataView } from '../../src/misc.js';
-import { EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
+import { AudioSampleSource, EncodedAudioPacketSource, EncodedVideoPacketSource } from '../../src/media-source.js';
 import { EncodedPacket } from '../../src/packet.js';
+import { AudioSample } from '../../src/sample.js';
+import { registerFlacEncoder } from '@mediabunny/flac-encoder';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
+
+test('FLAC sample entries match STREAMINFO', async () => {
+	registerFlacEncoder();
+
+	const formats = [new Mp4OutputFormat(), new Mp4OutputFormat({ fastStart: 'fragmented' }), new MovOutputFormat()];
+	for (const format of formats) {
+		for (const bitsPerSample of [24, 16]) {
+			for (const [sampleRate, entrySampleRate] of [
+				[44100, 44100], [48000, 48000], [96000, 48000], [192000, 48000],
+			] as const) {
+				const numberOfChannels = bitsPerSample === 16 ? 1 : 2;
+				const output = new Output({ format, target: new BufferTarget() });
+				const source = new AudioSampleSource({ codec: 'flac' });
+				output.addAudioTrack(source);
+				await output.start();
+
+				using sample = new AudioSample({
+					data: new Uint8Array(16 * numberOfChannels * (bitsPerSample === 16 ? 2 : 4)),
+					format: bitsPerSample === 16 ? 's16' : 's32',
+					numberOfChannels,
+					sampleRate,
+					timestamp: 0,
+				});
+				await source.add(sample);
+				source.close();
+				await output.finalize();
+
+				const bytes = Buffer.from(output.target.buffer!);
+				const view = toDataView(bytes);
+				const entry = bytes.indexOf('fLaC');
+				const config = bytes.indexOf('dfLa', entry);
+				expect(entry).toBeGreaterThan(0);
+				expect(config).toBeGreaterThan(entry);
+
+				const streamInfo = view.getUint32(config + 22);
+				expect(streamInfo >>> 12).toBe(sampleRate);
+				expect(((streamInfo >>> 9) & 7) + 1).toBe(numberOfChannels);
+				expect(((streamInfo >>> 4) & 31) + 1).toBe(bitsPerSample);
+				expect(view.getUint16(entry + 12)).toBe(0); // Version
+				expect(view.getUint16(entry + 20)).toBe(numberOfChannels);
+				expect(view.getUint16(entry + 22)).toBe(bitsPerSample);
+				expect(view.getUint32(entry + 28)).toBe(entrySampleRate * 2 ** 16);
+			}
+		}
+	}
+
+	using input = new Input({
+		source: new FilePathSource(path.join(__dirname, '../public/sample.flac')),
+		formats: ALL_FORMATS,
+	});
+	const track = await input.getPrimaryAudioTrack();
+	assert(track);
+
+	const output = new Output({ format: new Mp4OutputFormat(), target: new BufferTarget() });
+	const source = new EncodedAudioPacketSource('flac');
+	output.addAudioTrack(source);
+	await output.start();
+	await source.add((await new EncodedPacketSink(track).getFirstPacket())!, {
+		decoderConfig: {
+			...(await track.getDecoderConfig())!,
+			numberOfChannels: 1,
+			sampleRate: 48000,
+		},
+	});
+	await output.finalize();
+
+	const bytes = Buffer.from(output.target.buffer!);
+	const entry = bytes.indexOf('fLaC');
+	expect(entry).toBeGreaterThan(0);
+	expect(bytes.readUInt16BE(entry + 20)).toBe(2);
+	expect(bytes.readUInt32BE(entry + 28)).toBe(44100 * 2 ** 16);
+});
 
 test('ISOBMFF muxer internally converts ADTS to AAC', async () => {
 	using input = new Input({
