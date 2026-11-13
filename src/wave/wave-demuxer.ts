@@ -151,10 +151,10 @@ export class WaveDemuxer extends Demuxer {
 		const numChannels = readU16(slice, littleEndian);
 		const sampleRate = readU32(slice, littleEndian);
 		slice.skip(4); // Bytes per second
-		const blockAlign = readU16(slice, littleEndian);
+		slice.skip(2); // Block align
 
-		if (numChannels === 0 || sampleRate === 0 || blockAlign === 0) {
-			throw new Error('Invalid WAVE file - channel count, sample rate and block align must be positive');
+		if (numChannels === 0 || sampleRate === 0) {
+			throw new Error('Invalid WAVE file - channel count and sample rate must be positive');
 		}
 
 		let bitsPerSample: number;
@@ -212,7 +212,7 @@ export class WaveDemuxer extends Demuxer {
 			numberOfChannels: numChannels,
 			sampleRate,
 			sampleSizeInBytes: Math.ceil(bitsPerSample / 8),
-			blockSizeInBytes: blockAlign,
+			blockSizeInBytes: numChannels * Math.ceil(bitsPerSample / 8),
 		};
 	}
 
